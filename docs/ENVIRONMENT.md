@@ -30,26 +30,27 @@ only; **no credentials are stored in this repository**.
   `.venv` (vllm 0.10.1.1, torch 2.7.1+cu128). Serves as the legacy baseline
   "control" environment for M5 comparisons.
 - `/root/autodl-tmp/hf` — HF cache containing Qwen2.5-1.5B-Instruct (reusable
-  for smoke tests / M1 correctness runs).
-- `/root/autodl-tmp/FlexKV/ssd_cache{,2}` — 32 GB of generated FlexKV SSD
-  cache data from audit runs (regenerable artifacts; candidate for cleanup
-  when disk is needed — requires owner approval).
+  for smoke tests / M1 correctness runs; use `HF_HOME=/root/autodl-tmp/hf`).
+- `/root/autodl-tmp/FlexKV/ssd_cache{,2}` — **deleted 2026-11-20** (owner
+  -approved): 32 GB of regenerable FlexKV SSD cache artifacts, freeing the
+  data disk to 35 GB available.
 - `/root/kvloom-venv`, `/root/miniconda3` — unrelated; untouched.
 
-## Environment layout (planned)
+## Environment layout
 
-- Remote project dir: `/root/autodl-tmp/omnikv` (created by
+- Remote project dir: `/root/autodl-tmp/omnikv` (created and synced by
   `scripts/sync_remote.sh`).
-- Remote venv: `/root/autodl-tmp/omnikv/.venv` managed by `uv` with GPU
-  dependency set (vllm pinned per milestone; see `research.md` §9).
-- Local venv: `.venv` managed by `uv` with CPU-only dependency groups
-  (`dev`, `local-cpu`).
+- Remote `uv`: `~/.local/bin/uv` (0.13.9, standalone install).
+- Remote venv: `/root/autodl-tmp/omnikv/.venv` (Python 3.12, managed by `uv`),
+  GPU dependency set `vllm==0.34.0` installed from the Tsinghua mirror.
+- Local venv: `.venv` managed by `uv` (0.10.2) with CPU-only dependency
+  groups (`dev`, `local-cpu`).
 
 ## Constraints and notes
 
-1. **Disk pressure:** the 50 GB data disk had only ~3.5 GB free at audit
-   time (FlexKV artifacts + HF cache). GPU-stack installs (~10–15 GB)
-   require freeing space first (see cleanup candidate above).
+1. **Disk pressure: resolved 2026-11-20.** 32 GB of regenerable FlexKV SSD
+   cache artifacts were deleted (owner-approved); 35 GB now free. Remaining
+   budget still requires care: one vLLM GPU env (~10–15 GB) + model weights.
 2. **12 GB VRAM:** test models must be small (Qwen2.5-0.5B/1.5B class);
    `gpu_memory_utilization` budgets must respect the FlexKV control env
    not running concurrently.

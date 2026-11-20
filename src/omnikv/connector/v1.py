@@ -129,6 +129,10 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         self._num_pages = int(extra.get("omnikv.cpu_pages", 1024))
         self._save_enabled = bool(extra.get("omnikv.save_enabled", True))
+        # Test-mode hard gate (research.md §10 L1): after every load, copy
+        # the destination GPU regions back to host and require them to be
+        # bitwise identical to the store pages they came from.
+        self._verify_loads = bool(extra.get("omnikv.verify_load_bytes", False))
         # Scheduler-role bookkeeping.
         self._last_match: dict[str, tuple[int, int]] = {}
         self._pending_loads: dict[str, LoadSpec] = {}
@@ -203,7 +207,47 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             ticket = engine.submit("h2d", ops, fence=True)
             ticket.wait()  # M1: synchronous loads
             store.release_pages(pages)
+            if self._verify_loads:
+                self._verify_loaded_bytes(ops, engine)
             self._finished_recving.add(spec.request_id)
+
+    def _verify_loaded_bytes(
+        self,
+        ops: list[PageCopyOp],
+        engine: RegionTransferEngine,
+    ) -> None:
+        """L1 gate: read back the just-written GPU pages and memcmp the
+        source store bytes (which are host memory, readable via ctypes).
+
+        Proves the restore placed the exact bytes at the exact GPU
+        addresses, independent of kernel numerics (research.md §10).
+        """
+        import ctypes
+
+        import torch as _torch
+
+        total = sum(op.nbytes for op in ops)
+        scratch = _torch.empty(total, dtype=_torch.uint8, pin_memory=True)
+        base = scratch.data_ptr()
+        offset = 0
+        readback: list[PageCopyOp] = []
+        for op in ops:
+            readback.append(
+                PageCopyOp(src_ptr=op.dst_ptr, dst_ptr=base + offset, nbytes=op.nbytes)
+            )
+            offset += op.nbytes
+        engine.submit("d2h", readback, fence=False).wait()
+        offset = 0
+        for op, rb in zip(ops, readback):
+            got = bytes(scratch[offset : offset + op.nbytes].tolist())
+            offset += op.nbytes
+            want = ctypes.string_at(op.src_ptr, op.nbytes)
+            if got != want:
+                raise OmniKVError(
+                    "load verification failed: GPU bytes at "
+                    f"{hex(rb.src_ptr)} do not match the store page at "
+                    f"{hex(op.src_ptr)} ({op.nbytes} B)"
+                )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return  # loads complete synchronously in start_load_kv
@@ -299,6 +343,14 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         runtime = _RUNTIME
         if not runtime.ready or not self._eligible(request):
             return 0, False
+        # A save accepted by request_finished rides the *next* step's
+        # connector metadata before its pages land in the store. Defer the
+        # lookup (None == "query again later", per the base contract) while
+        # any saves are pending, so a prefix is never missed because its
+        # producer's save has not executed yet. M1 heuristic: defer on ANY
+        # pending save; hash-scoped deferral arrives with M3.
+        if self._pending_saves:
+            return None, False
         bs = self._block_size
         tokens = list(request.all_token_ids)[: request.num_tokens]
         # Never match into the final token: the scheduler needs >= 1 token

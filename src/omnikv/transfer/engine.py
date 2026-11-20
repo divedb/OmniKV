@@ -137,11 +137,12 @@ def _load_cudart() -> ctypes.CDLL:
     candidates += sorted(glob.glob(os.path.join(torch_lib, "libcudart.so*")))
     for sp in sys.path:
         if os.path.isdir(sp):
+            # Wheel layouts: nvidia/cu13/lib (cu13 line) and
+            # nvidia/cuda_runtime/lib (older naming).
             candidates += sorted(
                 glob.glob(
-                    os.path.join(
-                        sp, "nvidia", "cuda_runtime", "lib", "libcudart.so*"
-                    )
+                    os.path.join(sp, "nvidia", "**", "libcudart.so*"),
+                    recursive=True,
                 )
             )
     for path in candidates:

@@ -58,17 +58,28 @@ def _class_mro_names(obj: Any) -> set[str]:
 
 
 def _group_names_and_specs(group: Any) -> tuple[list[str], list[Any]]:
-    """Dual-form reader for one KV cache group (release vs. main API)."""
+    """Dual-form reader for one KV cache group (release vs. main API).
+
+    Handles the worker-side `UniformTypeKVCacheSpecs` container (same-typed
+    layers wrapped in one spec object; it does not derive from AttentionSpec
+    itself — unwrap to its `first_spec` for kind/geometry questions).
+    """
     names = getattr(group, "layer_names", None)
     if names is not None:  # v0.34.0 release: KVCacheGroupSpec
-        return list(names), [group.kv_cache_spec]
+        spec = group.kv_cache_spec
+        return list(names), [_unwrap_uniform(spec)]
     specs = getattr(group, "kv_cache_specs", None)  # main: post-#61452
     if isinstance(specs, Mapping):
-        return list(specs), list(specs.values())
+        return list(specs), [_unwrap_uniform(s) for s in specs.values()]
     raise RegistrationError(
         f"unrecognized KV cache group form: {type(group).__name__} has "
         "neither layer_names+kv_cache_spec nor kv_cache_specs"
     )
+
+
+def _unwrap_uniform(spec: Any) -> Any:
+    first = getattr(spec, "first_spec", None)
+    return first if first is not None else spec
 
 
 class VllmLayoutAdapter:
@@ -190,69 +201,94 @@ class VllmLayoutAdapter:
         page_bytes: int,
         layout: str,
     ) -> PageGeometry:
-        """Match the group to its KVCacheTensor and certify the strides.
+        """Match the group to its KVCacheTensor(s) and certify the strides.
 
-        Also resolves, from the registered per-layer views, the absolute
-        device base pointer of each layer's block 0 (``data_ptr`` already
-        includes the view's storage offset, i.e. ``l * layer_stride``).
+        Two structural forms occur (verified on vLLM 0.34.0):
+        - scheduler-side config: one tensor covering every group layer
+          (``layers == group.layer_names``);
+        - worker-side config under the extensible KV cache: one tensor per
+          layer (28 tensors of 1 layer each), each independently committable.
+
+        Both are matched by layer membership. The resolved per-layer base
+        pointers (``data_ptr`` of each registered view, which already
+        includes the view's storage offset) ride on `last_layer_ptrs`, and
+        the per-layer block stride on `last_block_stride`.
         """
         tensors = list(getattr(kv_cache_config, "kv_cache_tensors", []) or [])
-        match = None
+        owner: dict[str, Any] = {}
         for t in tensors:
-            if list(getattr(t, "layers", []) or []) == list(layer_names):
-                match = t
-                break
-        if match is None:
-            raise RegistrationError(
-                f"no KVCacheTensor matches the group's {len(layer_names)} layers"
-            )
-        layer_stride, block_stride = match.layer_stride, match.block_stride
-        offset = int(getattr(match, "offset", 0) or 0)
-        num_blocks = kv_cache_config.num_blocks
-
-        # Certify: a (layer, block) page must be one contiguous run and the
-        # stride arithmetic must not overlap distinct blocks' pages.
-        if page_bytes > block_stride and block_stride != layer_stride:
-            raise RegistrationError(
-                f"page ({page_bytes} B) exceeds block stride ({block_stride} B) "
-                "in a layer-compact layout; pages would overlap"
-            )
-        layer_compact = layout.startswith("L")
-        if layer_compact and block_stride < page_bytes:
-            raise RegistrationError(
-                f"layer-compact layout {layout} requires block_stride >= page; "
-                f"got block_stride={block_stride}, page={page_bytes}"
-            )
-        if not layer_compact and layer_stride != page_bytes:
-            raise RegistrationError(
-                f"block-outermost layout {layout} requires layer_stride == page; "
-                f"got layer_stride={layer_stride}, page={page_bytes}"
-            )
-        if layer_stride * len(layer_names) > int(match.size) + max(
-            layer_stride, block_stride
-        ):
-            raise RegistrationError(
-                "layer stride arithmetic exceeds the backing allocation size"
-            )
-
-        missing = [n for n in layer_names if n not in kv_caches]
+            for name in getattr(t, "layers", []) or []:
+                if name in owner:
+                    raise RegistrationError(
+                        f"layer {name!r} appears in multiple KVCacheTensors"
+                    )
+                owner[name] = t
+        missing = [n for n in layer_names if n not in owner]
         if missing:
             raise RegistrationError(
-                f"kv_caches is missing {len(missing)} of {len(layer_names)} "
-                f"registered layers (first missing: {missing[0]!r})"
+                f"{len(missing)} of {len(layer_names)} group layers have no "
+                f"KVCacheTensor (first missing: {missing[0]!r})"
             )
-        layer_ptrs = {}
+
+        block_strides = {owner[n].block_stride for n in layer_names}
+        if len(block_strides) != 1:
+            raise RegistrationError(
+                f"group layers disagree on block_stride: {sorted(block_strides)}"
+            )
+        block_stride = block_strides.pop()
+
+        missing_views = [n for n in layer_names if n not in kv_caches]
+        if missing_views:
+            raise RegistrationError(
+                f"kv_caches is missing {len(missing_views)} of "
+                f"{len(layer_names)} registered layers (first missing: "
+                f"{missing_views[0]!r})"
+            )
+        layer_ptrs: dict[str, int] = {}
         for n in layer_names:
             t = kv_caches[n]
-            if t.device.index is None or t.device.index != self.device_index:
+            device_index = getattr(t.device, "index", None)
+            if device_index is None or device_index != self.device_index:
                 raise RegistrationError(
                     f"layer {n!r} is on {t.device}; adapter targets device "
                     f"{self.device_index}"
                 )
             layer_ptrs[n] = t.data_ptr()
-        # The resolved per-layer base pointers ride along on the descriptor
-        # via `geometry.storage_id` bookkeeping in the connector; store them
-        # on the adapter result through the returned mapping below.
+
+        first = owner[layer_names[0]]
+        shared = len(tensors) == 1
+        offset = int(getattr(first, "offset", 0) or 0)
+        if shared:
+            layer_stride = first.layer_stride
+            layer_compact = layout.startswith("L")
+            if layer_compact and block_stride < page_bytes:
+                raise RegistrationError(
+                    f"layer-compact layout {layout} requires block_stride >= "
+                    f"page; got block_stride={block_stride}, page={page_bytes}"
+                )
+            if not layer_compact and layer_stride != page_bytes:
+                raise RegistrationError(
+                    f"block-outermost layout {layout} requires layer_stride == "
+                    f"page; got layer_stride={layer_stride}, page={page_bytes}"
+                )
+            if layer_stride * len(layer_names) > int(first.size) + max(
+                layer_stride, block_stride
+            ):
+                raise RegistrationError(
+                    "layer stride arithmetic exceeds the backing allocation size"
+                )
+        else:
+            # Per-layer tensors (worker/extensible form): each layer's pages
+            # live in their own region, so the group has no shared
+            # layer_stride. Geometry marks shared_storage=False; the copy
+            # path addresses through last_layer_ptrs + block_stride.
+            layer_stride = block_stride
+        if block_stride < page_bytes:
+            raise RegistrationError(
+                f"page ({page_bytes} B) exceeds block stride ({block_stride} B); "
+                "pages would overlap"
+            )
+        num_blocks = kv_cache_config.num_blocks
         self.last_layer_ptrs = layer_ptrs
         self.last_block_stride = block_stride
 
@@ -264,5 +300,5 @@ class VllmLayoutAdapter:
             storage_id=0,
             offset=offset,
             layer_names=tuple(layer_names),
-            shared_storage=True,
+            shared_storage=shared,
         )

@@ -231,6 +231,52 @@ class TestDescribe:
             == 5 * PAGE + 3 * PAGE * NUM_LAYERS
         )
 
+    def test_worker_per_layer_tensor_form(self):
+        # The extensible-KV-cache worker projection: one tensor per layer.
+        tensors = [
+            FakeTensor(
+                layers=[name],
+                size=NUM_BLOCKS * PAGE,
+                layer_stride=PAGE,
+                block_stride=PAGE,
+            )
+            for name in LAYER_NAMES
+        ]
+        cfg = make_release_config(kv_cache_tensors=tensors)
+        adapter = VllmLayoutAdapter()
+        (desc,) = adapter.describe(make_kv_caches(), cfg)
+        assert desc.geometry.shared_storage is False
+        assert desc.geometry.block_stride == PAGE
+        assert len(adapter.last_layer_ptrs) == NUM_LAYERS
+        assert adapter.last_block_stride == PAGE
+
+    def test_layer_in_multiple_tensors_rejected(self):
+        tensors = [
+            FakeTensor(
+                layers=list(LAYER_NAMES),
+                size=NUM_BLOCKS * PAGE * NUM_LAYERS,
+                layer_stride=LAYER_STRIDE,
+                block_stride=PAGE,
+            ),
+            FakeTensor(
+                layers=[LAYER_NAMES[0]],
+                size=NUM_BLOCKS * PAGE,
+                layer_stride=PAGE,
+                block_stride=PAGE,
+            ),
+        ]
+        cfg = make_release_config(kv_cache_tensors=tensors)
+        with pytest.raises(RegistrationError, match="multiple KVCacheTensors"):
+            VllmLayoutAdapter().describe(make_kv_caches(), cfg)
+
+    def test_layer_without_tensor_rejected(self):
+        tensors = [
+            FakeTensor(layers=[LAYER_NAMES[0]], size=1, layer_stride=PAGE, block_stride=PAGE)
+        ]
+        cfg = make_release_config(kv_cache_tensors=tensors)
+        with pytest.raises(RegistrationError, match="have no KVCacheTensor"):
+            VllmLayoutAdapter().describe(make_kv_caches(), cfg)
+
     def test_missing_registered_layer_rejected(self):
         caches = make_kv_caches()
         caches.pop(LAYER_NAMES[5])

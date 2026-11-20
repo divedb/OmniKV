@@ -1,14 +1,15 @@
-"""Unit tests for core value types (omnikv.types)."""
+"""Unit tests for core value types (omnikv.types) — M2 model."""
 
 from __future__ import annotations
 
 import pytest
 
 from omnikv.types import (
-    BlockView,
     CopyRun,
     FormatFingerprint,
     GroupDescriptor,
+    GroupPlacement,
+    LayerAddress,
     PageGeometry,
     StateKind,
     StateSemantics,
@@ -24,6 +25,7 @@ def make_fingerprint(**over) -> FormatFingerprint:
         "head_geometry": (2, 128, 128, 64),
         "page_bytes": (65536, 65536),
         "scale_layout": None,
+        "page_fragments": (65536,),
     }
     kwargs.update(over)
     return FormatFingerprint(**kwargs)
@@ -70,7 +72,17 @@ class TestFormatFingerprint:
             make_fingerprint(layout="NHD")
 
     def test_version_bump_changes_identity(self):
-        assert make_fingerprint().identity != make_fingerprint(version=2).identity
+        assert make_fingerprint().identity != make_fingerprint(version=3).identity
+
+    def test_fragments_change_identity(self):
+        frag = make_fingerprint(
+            layout="LHBNC", page_fragments=(32768, 32768)
+        )
+        assert frag.identity != make_fingerprint(layout="LHBNC").identity
+
+    def test_fragments_must_sum_to_payload(self):
+        with pytest.raises(ValueError, match="do not sum"):
+            make_fingerprint(page_fragments=(1024, 2048))
 
 
 class TestPageGeometry:
@@ -79,8 +91,7 @@ class TestPageGeometry:
         geo = make_geometry()
         assert geo.layer_block_offset(0, 0) == 0
         assert geo.layer_block_offset(1, 0) == geo.layer_stride
-        assert geo.layer_block_offset(0, 1) == geo.page_bytes
-        # Deriving from num_blocks would give a WRONG answer here.
+        assert geo.layer_block_offset(0, 1) == geo.block_stride
         assert geo.layer_stride != geo.num_blocks * geo.page_bytes
 
     def test_invalid_geometry_rejected(self):
@@ -88,6 +99,8 @@ class TestPageGeometry:
             make_geometry(page_bytes=0)
         with pytest.raises(ValueError):
             make_geometry(layer_stride=-1)
+        with pytest.raises(ValueError):
+            make_geometry(block_stride=0)
         with pytest.raises(ValueError):
             make_geometry(layer_names=())
 
@@ -110,26 +123,77 @@ class TestCopyRun:
 
 
 class TestBlockView:
-    def test_passthrough_view_is_single_run(self):
-        geo = make_geometry()
-        view = make_descriptor(geometry=geo).block_view(7)
+    def test_single_fragment_page_is_single_run(self):
+        view = make_descriptor().block_view(7)
         assert view.is_single_run
-        regions = view.gpu_regions(device_index=0)
-        assert len(regions) == 28
-        assert all(r.size == 65536 for r in regions)
-        assert regions[3].offset == geo.layer_block_offset(3, 7)
 
-    def test_run_decomposed_not_supported_yet(self):
-        desc = make_descriptor()
-        run = CopyRun(0, 0, 32, num_fragments=64, local_stride=32, remote_stride=64)
-        view = BlockView(
-            group_id=0,
-            block_id=0,
-            semantics=desc.semantics,
-            fingerprint=desc.fingerprint,
-            geometry=desc.geometry,
-            runs=(run,),
-        )
+    def test_fragmented_page_is_not_single_run(self):
+        fp = make_fingerprint(layout="LHBNC", page_fragments=(32768, 32768))
+        view = make_descriptor(fingerprint=fp).block_view(0)
         assert not view.is_single_run
-        with pytest.raises(NotImplementedError):
-            view.gpu_regions()
+
+    def test_requires_conversion(self):
+        fp_a, fp_b = make_fingerprint(), make_fingerprint(layout="LBHNC")
+        view = make_descriptor(fingerprint=fp_a).block_view(0)
+        assert view.requires_conversion_to(fp_b)
+        assert not view.requires_conversion_to(fp_a)
+
+
+class TestGroupPlacement:
+    def test_single_fragment_placement_ops(self):
+        base = 0x10000
+        placement = GroupPlacement(
+            addresses=tuple(
+                LayerAddress(
+                    base_ptr=base + i * 65536,
+                    offsets=(0,),
+                    block_strides=(65536,),
+                    sizes=(65536,),
+                    layer_name=f"layer.{i}",
+                )
+                for i in range(2)
+            ),
+            page_offsets=(0, 65536),
+        )
+        ops = placement.gpu_ops(block_id=3)
+        assert len(ops) == 2
+        assert ops[0] == (base + 3 * 65536, 65536)
+        assert ops[1] == (base + 65536 + 3 * 65536, 65536)
+        assert placement.store_page_bytes == 2 * 65536
+
+    def test_fragmented_placement_ops(self):
+        # LHBNC-like: 2 heads, fragment stride = page/heads per block.
+        head_stride = 100 * 64 * 512  # num_blocks * N * C
+        placement = GroupPlacement(
+            addresses=(
+                LayerAddress(
+                    base_ptr=0x20000,
+                    offsets=(0, head_stride),
+                    block_strides=(64 * 512, 64 * 512),
+                    sizes=(64 * 512, 64 * 512),
+                    layer_name="layer.0",
+                ),
+            ),
+            page_offsets=(0,),
+        )
+        ops = placement.gpu_ops(block_id=5)
+        assert len(ops) == 2
+        assert ops[0] == (0x20000 + 5 * 64 * 512, 64 * 512)
+        assert ops[1] == (0x20000 + head_stride + 5 * 64 * 512, 64 * 512)
+        assert placement.store_page_bytes == 65536
+
+    def test_page_offsets_must_be_dense(self):
+        with pytest.raises(ValueError, match="dense"):
+            GroupPlacement(
+                addresses=(
+                    LayerAddress(0, (0,), (128,), (128,)),
+                    LayerAddress(0, (0,), (128,), (128,)),
+                ),
+                page_offsets=(0, 256),
+            )
+
+    def test_layer_address_validation(self):
+        with pytest.raises(ValueError, match="equal length"):
+            LayerAddress(0, (0, 1), (128,), (128, 128))
+        with pytest.raises(ValueError, match="invalid fragment"):
+            LayerAddress(0, (0,), (64,), (128,))  # stride < size

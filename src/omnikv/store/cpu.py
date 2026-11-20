@@ -163,6 +163,17 @@ class CpuPageStore:
         """Host pointer of one stored page slot (all layers, layer-major)."""
         return self.pool.data_ptr() + page_index * self.slot_bytes
 
+    def pool_slice(self, page_index: int):
+        """The store page slot as a 1-D uint8 tensor slice (codec I/O)."""
+        if self.pool._tensor is None:  # local-test ctypes pool
+            raise StoreError("pool_slice requires a torch-backed pool")
+        return self.pool._tensor[page_index * self.slot_bytes : (page_index + 1) * self.slot_bytes]
+
+    def touch(self, key: BlockKey) -> None:
+        """Mark a key most-recently-used (eviction-order hygiene)."""
+        if key in self._lru:
+            self._lru.move_to_end(key)
+
     def layer_offset(self, layer_index: int) -> int:
         """Byte offset of one layer's page within a stored page slot."""
         return layer_index * self.page_bytes

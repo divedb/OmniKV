@@ -38,7 +38,7 @@ PY = sys.executable
 
 
 def _run(mode: str, out: str, *extra: str) -> None:
-    proc = subprocess.run(
+    proc = subprocess.run(  # noqa: PLW1510 - rc checked below
         [PY, os.path.join(HERE, "m1_run.py"), mode, os.path.join(HERE, out), *extra],
         capture_output=True,
         text=True,

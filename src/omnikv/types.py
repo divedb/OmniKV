@@ -44,7 +44,9 @@ LAYOUT_FAMILIES = frozenset(
 )
 
 # Bump on any change to fingerprint derivation or run semantics.
-FORMAT_VERSION = 1
+# v2: adds `page_fragments` (store-page interior structure) — pages saved
+# under v1 fingerprints are not compatible (different identity namespace).
+FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -53,7 +55,15 @@ class FormatFingerprint:
 
     Two pages may be byte-copied between each other without reinterpretation
     iff their fingerprints compare equal (same state content encoding, same
-    stride permutation, same dtype/quant, same geometry, same version).
+    stride permutation, same dtype/quant, same geometry, same store-page
+    interior structure, same version).
+
+    ``page_fragments`` records how a store page is decomposed into
+    contiguous runs in *engine* memory: block-compact layouts have one
+    fragment (the whole page); head-fragmented layouts (LHBNC/BHLNC) have
+    one fragment per KV head, stored head-major. The store page is always
+    the concatenation of its fragments, so its total size is
+    ``sum(page_fragments)``.
     """
 
     state_kind: StateKind
@@ -63,6 +73,7 @@ class FormatFingerprint:
     head_geometry: tuple[int, ...]
     page_bytes: tuple[int, ...]
     scale_layout: str | None
+    page_fragments: tuple[int, ...] = ()
     version: int = FORMAT_VERSION
 
     def __post_init__(self) -> None:
@@ -71,6 +82,17 @@ class FormatFingerprint:
                 f"unknown layout family {self.layout!r}; "
                 f"expected one of {sorted(LAYOUT_FAMILIES)}"
             )
+        payload = self.page_bytes[0]
+        if self.page_fragments and sum(self.page_fragments) != payload:
+            raise ValueError(
+                f"page_fragments {self.page_fragments} do not sum to the "
+                f"page payload {payload}"
+            )
+
+    @property
+    def fragments(self) -> tuple[int, ...]:
+        """Store-page fragment sizes (defaults to one whole page)."""
+        return self.page_fragments or (self.page_bytes[0],)
 
     @property
     def identity(self) -> str:
@@ -86,6 +108,7 @@ class FormatFingerprint:
                 self.head_geometry,
                 self.page_bytes,
                 self.scale_layout,
+                self.page_fragments,
                 self.version,
             )
         )
@@ -206,7 +229,8 @@ class BlockView:
 
     Pure value object: addressing + compatibility only. Produced exclusively
     by a `omnikv.adapter.LayoutAdapter`; the core never constructs these
-    from raw tensors.
+    from raw tensors. GPU-side execution addressing lives on
+    `GroupPlacement` (which holds the runtime-resolved device pointers).
     """
 
     group_id: int
@@ -214,40 +238,83 @@ class BlockView:
     semantics: StateSemantics
     fingerprint: FormatFingerprint
     geometry: PageGeometry
-    # Page-relative byte correspondence GPU page <-> store page. Empty means
-    # "whole page, identity" (the M1 passthrough case).
+    # Page-relative byte correspondence GPU page <-> store page (codec use).
     runs: tuple[CopyRun, ...] = ()
 
     @property
     def is_single_run(self) -> bool:
         """True when the page is one contiguous byte run (memcpy-able)."""
-        return not self.runs or (
-            len(self.runs) == 1
-            and self.runs[0].num_fragments == 1
-            and self.runs[0].fragment_size == self.geometry.page_bytes
-        )
+        return len(self.fingerprint.fragments) == 1
 
-    def gpu_regions(self, device_index: int = 0) -> tuple[GpuRegion, ...]:
-        """Absolute GPU regions for this block, one per layer (M1: whole
-        contiguous pages; run-decomposed regions arrive with M2 codecs)."""
-        geo = self.geometry
-        if not geo.shared_storage:
-            raise NotImplementedError(
-                "per-layer storages are not supported until M2"
-            )
-        if not self.is_single_run:
-            raise NotImplementedError(
-                "run-decomposed regions are not supported until M2"
-            )
-        return tuple(
-            GpuRegion(
-                storage_id=geo.storage_id,
-                device_index=device_index,
-                offset=geo.layer_block_offset(layer_index, self.block_id),
-                size=geo.page_bytes,
-            )
-            for layer_index in range(geo.num_layers)
-        )
+    def requires_conversion_to(self, dst: FormatFingerprint) -> bool:
+        """Whether moving this page to ``dst`` needs a registered codec."""
+        return self.fingerprint != dst
+
+
+@dataclass(frozen=True)
+class LayerAddress:
+    """GPU addressing of one page's fragments within one layer component.
+
+    Fragment ``i`` of block ``b`` spans ``base_ptr + offsets[i] +
+    b * block_strides[i]`` for ``sizes[i]`` bytes. Block-compact layouts
+    have exactly one fragment; head-fragmented layouts (LHBNC/BHLNC) have
+    one per KV head. ``component`` labels sub-tensors of one layer (e.g.
+    ``"kv"`` for the fused vLLM layout, ``"k"``/``"v"`` for engines with
+    separate key/value tensors).
+    """
+
+    base_ptr: int
+    offsets: tuple[int, ...]
+    block_strides: tuple[int, ...]
+    sizes: tuple[int, ...]
+    component: str = "kv"
+    layer_name: str = ""
+
+    def __post_init__(self) -> None:
+        if not (len(self.offsets) == len(self.block_strides) == len(self.sizes)):
+            raise ValueError("fragment arrays must have equal length")
+        if not self.offsets:
+            raise ValueError("at least one fragment is required")
+        for off, stride, size in zip(self.offsets, self.block_strides, self.sizes):
+            if size <= 0 or stride < size or off < 0:
+                raise ValueError(
+                    f"invalid fragment (offset={off}, stride={stride}, size={size})"
+                )
+
+
+@dataclass(frozen=True)
+class GroupPlacement:
+    """Runtime-resolved GPU addressing for every (layer, component) of a
+    group. Produced by a LayoutAdapter at registration; consumed to build
+    transfer ops. Store pages hold the fragments of each address in order,
+    layer-major."""
+
+    addresses: tuple[LayerAddress, ...]
+    # Store-page offset of each address's fragment block, precomputed.
+    page_offsets: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.page_offsets) != len(self.addresses):
+            raise ValueError("one page offset is required per address")
+        expected = 0
+        for off, addr in zip(self.page_offsets, self.addresses):
+            if off != expected:
+                raise ValueError(
+                    "page offsets must be the dense cumulative fragment sums"
+                )
+            expected += sum(addr.sizes)
+
+    @property
+    def store_page_bytes(self) -> int:
+        return sum(sum(a.sizes) for a in self.addresses)
+
+    def gpu_ops(self, block_id: int) -> list[tuple[int, int]]:
+        """(gpu_ptr, size) for each fragment of one block, in store order."""
+        ops: list[tuple[int, int]] = []
+        for addr in self.addresses:
+            for off, stride, size in zip(addr.offsets, addr.block_strides, addr.sizes):
+                ops.append((addr.base_ptr + off + block_id * stride, size))
+        return ops
 
 
 @dataclass(frozen=True)

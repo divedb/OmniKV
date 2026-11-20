@@ -87,15 +87,15 @@ def main() -> None:
     from vllm.config import KVTransferConfig
 
     model = args.model or MODEL
-    kwargs = dict(
-        model=model,
-        gpu_memory_utilization=0.85,
-        max_model_len=args.max_model_len,
-        enforce_eager=True,
+    kwargs = {
+        "model": model,
+        "gpu_memory_utilization": 0.85,
+        "max_model_len": args.max_model_len,
+        "enforce_eager": True,
         # baseline: full recompute. connector: the ONLY cache is OmniKV's.
         # pcache: vLLM's native prefix cache (the control).
-        enable_prefix_caching=(args.mode == "pcache"),
-    )
+        "enable_prefix_caching": (args.mode == "pcache"),
+    }
     if args.mode == "connector":
         kwargs["kv_transfer_config"] = KVTransferConfig(
             kv_connector="OmniKVConnectorV1",
@@ -144,10 +144,10 @@ def main() -> None:
         result["outputs"]["a"] = serialize(out)
         stats_after_save = None
         if connector_module is not None:
-            stats_after_save = dict(
-                saved=connector_module._RUNTIME.stats_saved,
-                hits=connector_module._RUNTIME.stats_hits,
-            )
+            stats_after_save = {
+                "saved": connector_module._RUNTIME.stats_saved,
+                "hits": connector_module._RUNTIME.stats_hits,
+            }
         # Phase B: shares the prefix; must reuse it from the cache.
         out = llm.generate([PROMPTS["b"]], sp)[0]
         result["outputs"]["b"] = serialize(out)

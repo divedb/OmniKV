@@ -194,3 +194,18 @@ optimization targets: fused repack kernels or direct fragment-mapped H2D
    batched for a single submit — every block read the last repack. Fixed
    with a combined per-block-offset scratch (caught by the output gate
    reproducing degenerate repetition).
+6. Ops hazards on the test side: a stale download job's symlink clobbered
+   the model path; an over-greedy regex cleanup removed the main M2 test
+   (restored; guarded by `grep -c def test_` in the run chain).
+
+### M2 final matrix (2026-11-20, instance 2, all green in 295 s)
+
+| Test | Result |
+|---|---|
+| M1 correctness (LBNHC, Qwen GQA) | ✅ restore == native pcache |
+| M1 eviction pressure (4-page store) | ✅ |
+| M1 MHA geometry (gpt2, 12:12 heads) | ✅ |
+| **M2 cross-layout (LBNHC → LBHNC via codec)** | ✅ codec_hits=4; token-identical to native LBHNC pcache; symmetric drift vs recompute |
+
+The M1 file passing under the v2 core is the M1-regression gate
+(fingerprint v2 + placement-driven ops changed every code path).

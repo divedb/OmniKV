@@ -75,15 +75,22 @@ def main() -> None:
     parser.add_argument("mode", choices=["baseline", "connector", "pcache"])
     parser.add_argument("out")
     parser.add_argument("--cpu-pages", type=int, default=64)
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="local model path (default: the cached Qwen2.5-1.5B snapshot)",
+    )
+    parser.add_argument("--max-model-len", type=int, default=1024)
     args = parser.parse_args()
 
     from vllm import LLM, SamplingParams
     from vllm.config import KVTransferConfig
 
+    model = args.model or MODEL
     kwargs = dict(
-        model=MODEL,
+        model=model,
         gpu_memory_utilization=0.85,
-        max_model_len=1024,
+        max_model_len=args.max_model_len,
         enforce_eager=True,
         # baseline: full recompute. connector: the ONLY cache is OmniKV's.
         # pcache: vLLM's native prefix cache (the control).

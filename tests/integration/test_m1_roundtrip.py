@@ -144,3 +144,32 @@ def test_eviction_under_pressure_still_correct():
         conn["outputs"]["b"]["token_ids"] == pcache["outputs"]["b"]["token_ids"]
     ), "output 'b' diverged from the native-cache control under eviction pressure"
     print("\n[M1] outputs remain correct under store pressure.")
+
+
+GPT2_DIR = "/root/autodl-tmp/models/models/AI-ModelScope--gpt2/snapshots/master"
+
+
+@pytest.mark.order(3)
+def test_second_model_mha_geometry():
+    """M1 'done when' matrix: a second model with MHA geometry (GPT-2: 12
+    layers, 12/12 KV heads, head 64, 192 KiB pages). The core must be
+    geometry-agnostic: fingerprint + strides carry everything."""
+    if not os.path.isdir(GPT2_DIR):
+        pytest.skip(f"gpt2 not downloaded at {GPT2_DIR}")
+    _run("baseline", "m1_gpt2_base.json", "--model", GPT2_DIR)
+    _run("pcache", "m1_gpt2_pcache.json", "--model", GPT2_DIR)
+    _run("connector", "m1_gpt2_conn.json", "--model", GPT2_DIR)
+    base, pc, co = (
+        _load("m1_gpt2_base.json"),
+        _load("m1_gpt2_pcache.json"),
+        _load("m1_gpt2_conn.json"),
+    )
+    assert co["stats"]["final"]["saved"] >= 4
+    assert co["stats"]["final"]["hits"] >= 4
+    assert (
+        co["outputs"]["a"]["token_ids"] == base["outputs"]["a"]["token_ids"]
+    ), "gpt2 phase A diverged from baseline"
+    assert (
+        co["outputs"]["b"]["token_ids"] == pc["outputs"]["b"]["token_ids"]
+    ), "gpt2: OmniKV restore differs from native prefix-cache reuse"
+    print("\n[M1] MHA model (gpt2): OmniKV restore == native prefix cache.")

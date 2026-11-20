@@ -106,3 +106,32 @@ is preserved in git history of `test_m1_roundtrip.py`.
    now authoritative.
 5. Test-harness bugs (class-name mutation contaminating tests, `Logprob`
    objects, inverted prefix-cache flag) — all in tests, fixed.
+
+### M1 validation matrix (all on remote RTX 3080 Ti)
+
+| Configuration | Result |
+|---|---|
+| Qwen2.5-1.5B (GQA, 28L, 2 KV heads, 64 KiB pages), LBNHC | ✅ restore == native pcache (token-identical); saved=4, hits=4 |
+| Qwen2.5-1.5B, **LBHNC (HND)** via `VLLM_KV_CACHE_LAYOUT` | ✅ token-identical; saved=4, hits=4 |
+| gpt2 (**MHA**, 12L, 12:12 heads, 192 KiB pages), LBNHC | ✅ token-identical; saved=4, hits=4 |
+| Eviction pressure (4-page store, LRU + reservations) | ✅ token-identical to control |
+| Bitwise L1 read-back (`omnikv.verify_load_bytes`) | ✅ every restored page byte-equal on GPU |
+
+### M1 benchmark (`tests/integration/m1_bench.py`, 2026-11-20)
+
+| Geometry | Payload | d2h | h2d |
+|---|---|---|---|
+| 28 × 64 KiB (Qwen) × 256 blocks | 448 MiB | 9.44 GiB/s | 7.77 GiB/s |
+| 12 × 192 KiB (gpt2) × 256 blocks | 576 MiB | 9.09 GiB/s | 9.44 GiB/s |
+
+~50% of practical PCIe 4.0 bandwidth; the per-(layer,block) copy-submission
+loop is the known bottleneck — contiguous-page coalescing is the first M3
+batching target (research.md §8.2).
+
+### M1 residual items (deferred, with rationale)
+
+- Preemption stress test: aborted requests are already skipped defensively
+  in `request_finished`; a dedicated stress test lands with the async-save
+  machinery in M3 (where preemption actually races in-flight transfers).
+- Per-step connector overhead at ≥128 concurrent requests: needs the
+  concurrency harness; deferred to M3 alongside async loads.

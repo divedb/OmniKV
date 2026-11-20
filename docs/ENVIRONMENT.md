@@ -56,10 +56,20 @@ only; **no credentials are stored in this repository**.
    not running concurrently.
 3. **Python PATH:** non-interactive SSH has no conda on PATH; all remote
    commands must use absolute venv paths (the project `.venv` handles this).
-4. **CUDA wheels:** system toolkit is 12.8 but the driver (595.x) supports
-   CUDA 13.x runtimes; current vLLM wheels (CUDA 13.0 line) are expected to
-   work — must be validated by an on-GPU smoke test before any dependency on
-   it (research.md open question Q6 discipline).
+4. **CUDA wheels: validated.** torch 2.14.0+cu130 + vllm 0.34.0 run correctly
+   on the sm_86 GPU with driver 595.x (smoke test 2026-11-20, see
+   `docs/TESTLOG.md`).
+5. **HF offline usage:** `huggingface_hub` 2.4.0 cannot resolve revisions
+   offline from the existing cache; pass the snapshot directory path as
+   `model=` instead (see `scripts/smoke_vllm.py`).
+6. **vLLM API skew:** the 0.34.0 *release* still ships the pre-#61452
+   `KVCacheGroupSpec` (singular `kv_cache_spec`), unlike `main` researched in
+   `research.md`. The adapter must dual-form-read both (precedent: LMCache
+   `group_*` helpers).
+7. **KVCacheTensor strides ≠ derived values:** measured padding of ~111
+   block slots per layer on this stack (extensible-KV-cache headroom).
+   Never compute `layer_stride` from `num_blocks`; always use reported
+   strides (see TESTLOG for the measured numbers).
 
 ## Workflow (per project rules)
 

@@ -61,3 +61,48 @@ empirically confirms the research.md §4 decision to carry
    The smoke script's introspection now reads both forms (dual-form reader,
    same approach as LMCache). OmniKV's vLLM adapter must ship this shim
    (research.md §2.1.7, open question Q6).
+
+## 2026-11-20 — M1 integration (tests/integration/test_m1_roundtrip.py)
+
+Stack: vLLM 0.34.0, torch 2.14.0+cu130, Qwen2.5-1.5B-Instruct (cached),
+LBNHC, block 64, eager, `VLLM_ENABLE_V1_MULTIPROCESSING=0`.
+
+**Result: 2/2 PASSED** (`test_m1_cache_reuse_matches_native_prefix_cache`,
+`test_eviction_under_pressure_still_correct`).
+
+Evidence recorded:
+
+| Gate | Result |
+|---|---|
+| Store usage (64-page pool) | saved=4, hits=4, store_len=4 |
+| Bitwise L1 read-back (verify_load_bytes) | all restored GPU pages byte-equal to store pages |
+| Connector-A == baseline-A | token-identical (recompute path unaffected) |
+| **Connector-B == native-prefix-cache-B** | **token-identical (decisive gate)** |
+| Cache-vs-recompute divergence | both cache paths diverge at the same token (19) — inherent bf16 prefix-reuse drift, not corruption |
+| Eviction pressure (4-page store) | outputs token-identical to the native-cache control; free_pages=0 |
+
+Methodology note: exact token equality between cache-reuse and full
+recompute is NOT a valid gate on this stack (reused KV bytes are produced
+under a different prefill chunk shape, so bf16 near-ties can flip). The
+valid gate is equivalence to vLLM's own prefix-cache reuse semantics,
+which OmniKV matches exactly. The near-tie logprob analysis that led here
+is preserved in git history of `test_m1_roundtrip.py`.
+
+### Issues hit and fixes (M1)
+
+1. Worker-side `kv_cache_config` under the extensible KV cache uses **one
+   `KVCacheTensor` per layer** (28×1) vs the scheduler-side single tensor
+   (1×28). Adapter now matches tensors by layer membership; per-layer
+   addressing via registered view pointers + `block_stride`.
+2. `libcudart.so.13` lives at `nvidia/cu13/lib/` in the cu13 wheel layout;
+   loader now globs `nvidia/**/libcudart.so*` recursively.
+3. Save/load ordering: a save accepted by `request_finished` rides the next
+   step's metadata, so a lookup could miss pages not yet landed. Fix:
+   `get_num_new_matched_tokens` returns `None` (re-query) while saves are
+   pending — the base-class async-lookup contract.
+4. Unit test caught a real design bug: `layer_block_offset` derived the
+   block offset from `page_bytes` instead of `block_stride` (identical for
+   layer-compact layouts, wrong for BLNHC). `PageGeometry.block_stride` is
+   now authoritative.
+5. Test-harness bugs (class-name mutation contaminating tests, `Logprob`
+   objects, inverted prefix-cache flag) — all in tests, fixed.

@@ -60,7 +60,11 @@ from omnikv.codec import DEFAULT_REGISTRY, CodecRegistry
 from omnikv.errors import CompatibilityError, OmniKVError, StoreError
 from omnikv.keys import BlockKey, chain_block_hashes
 from omnikv.store.cpu import CpuPageStore
-from omnikv.transfer.engine import PageCopyOp, RegionTransferEngine
+from omnikv.transfer.engine import (
+    PageCopyOp,
+    RegionTransferEngine,
+    coalesce_ops,
+)
 from omnikv.types import FormatFingerprint, GroupPlacement
 
 try:  # present in 0.34.0; guarded for forward compatibility
@@ -81,6 +85,10 @@ class LoadSpec:
     # Non-empty: pages come from other-fingerprint stores, converted by the
     # codec. Parallel to dst_block_ids/hashes: (store_fingerprint_id, page).
     conversions: list[tuple[str, int]] = field(default_factory=list)
+    # Engine generation at build time; the worker refuses to execute plans
+    # from a superseded engine (M3 hardening: two live engines must never
+    # share placement).
+    generation: int = 0
 
 
 @dataclass
@@ -90,6 +98,7 @@ class SaveSpec:
     request_id: str
     src_block_ids: list[int]
     hashes: list[bytes]
+    generation: int = 0
 
 
 @dataclass
@@ -98,6 +107,17 @@ class OmniKVMetadata(KVConnectorMetadata):
 
     loads: list[LoadSpec] = field(default_factory=list)
     saves: list[SaveSpec] = field(default_factory=list)
+
+
+@dataclass
+class _SaveTicket:
+    """State of one asynchronous save awaiting D2H completion."""
+
+    ticket: Any  # TransferTicket
+    store: Any  # CpuPageStore | SpillStore
+    fingerprint_id: str
+    acquired: list[tuple[BlockKey, int]]  # (key, page) to publish
+    scratch: torch.Tensor | None = None  # keeps any codec buffers alive
 
 
 class _Runtime:
@@ -115,9 +135,18 @@ class _Runtime:
         self.stores: dict[str, CpuPageStore] = {}
         self.engine: RegionTransferEngine | None = None
         self.registry = registry or DEFAULT_REGISTRY
+        # Bumped on every register_kv_caches; specs carry the generation
+        # they were built under and workers refuse stale ones (M3).
+        self.generation = 0
+        # Async-save tickets in flight (worker submits, get_transfer_results
+        # publishes). The scheduler defers lookups while this is non-zero so
+        # a prefix is never missed because its producer's D2H has not
+        # completed (readiness-before-visibility, research.md §7.4).
+        self.pending_saves = 0
         self.stats_hits = 0
         self.stats_codec_hits = 0
         self.stats_saved = 0
+        self.stats_save_failures = 0
 
     @property
     def ready(self) -> bool:
@@ -240,14 +269,19 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         self._cross_layout = bool(extra.get("omnikv.cross_layout", False))
         self._preload_store = str(extra.get("omnikv.preload_store", "") or "")
         self._preloaded = False
+        self._spill_dir = str(extra.get("omnikv.spill_dir", "") or "")
+        self._spill_pages = int(extra.get("omnikv.spill_pages", 4096))
         # Scheduler-role bookkeeping.
         self._last_match: dict[str, tuple[int, int]] = {}
-        self._load_ctx: dict[str, tuple[int, list[tuple[str, int]]]] = {}
+        self._load_ctx: dict[str, tuple[int, list[tuple[str, int]], int]] = {}
         self._pending_loads: dict[str, LoadSpec] = {}
         self._pending_saves: dict[str, SaveSpec] = {}
-        # Worker-role completion sets.
+        self._steps = 0
+        # Worker-role completion state: async save tickets keyed by request
+        # id, each carrying what to publish when the D2H completes.
         self._finished_sending: set[str] = set()
         self._finished_recving: set[str] = set()
+        self._save_tickets: dict[str, _SaveTicket] = {}
 
     # ------------------------------------------------------------------
     # Worker side
@@ -259,15 +293,40 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         assert adapter.last_placement is not None
         _RUNTIME.descriptor = descriptor
         _RUNTIME.placement = adapter.last_placement
+        _RUNTIME.generation += 1
         # Create (or reuse, across sequential engines) the store for this
         # fingerprint. Store pages are host memory keyed by fingerprint, so
         # they persist independently of the current engine's GPU addresses.
         _RUNTIME.store_for(descriptor.fingerprint, self._num_pages)
+        if self._spill_dir:
+            self._install_spill(descriptor.fingerprint)
         if _RUNTIME.engine is None:
             _RUNTIME.engine = RegionTransferEngine(device_index=adapter.device_index)
         if self._preload_store and not self._preloaded:
             load_runtime_stores(self._preload_store)
             self._preloaded = True
+
+    def _install_spill(self, fingerprint) -> None:
+        """Wrap the fingerprint's hot store with a disk spill tier."""
+        from omnikv.store.disk import DiskPageStore
+        from omnikv.store.spill import SpillStore
+
+        fp_id = fingerprint.identity
+        if isinstance(_RUNTIME.stores.get(fp_id), SpillStore):
+            return
+        hot = _RUNTIME.stores.get(fp_id)
+        assert hot is not None
+        cold = DiskPageStore(hot.descriptor, self._spill_dir, self._spill_pages)
+        _RUNTIME.stores[fp_id] = SpillStore(hot, cold)
+
+    def _check_generation(self, spec_generation: int, what: str) -> None:
+        if spec_generation != _RUNTIME.generation:
+            raise OmniKVError(
+                f"{what} built for engine generation {spec_generation} but "
+                f"the runtime is at generation {_RUNTIME.generation}; "
+                "sequential engines only — a plan from a superseded engine "
+                "must never execute against the current placement"
+            )
 
     def start_load_kv(
         self, forward_context: ForwardContext, **kwargs: Any
@@ -283,6 +342,7 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         fingerprint = runtime.descriptor.fingerprint
         primary = runtime.stores[fingerprint.identity]
         for spec in meta.loads:
+            self._check_generation(spec.generation, "load spec")
             ops: list[PageCopyOp] = []
             sources: list[tuple[int, int]] = []  # (host_ptr, nbytes) per op
             reserved: list[tuple[CpuPageStore, list[int]]] = []
@@ -353,14 +413,18 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
                         )
                         sources.append((host_base + host_off, size))
                         host_off += size
-                ticket = engine.submit("h2d", ops, fence=True)
-                ticket.wait()  # synchronous loads (M1/M2)
+                ticket = engine.submit("h2d", coalesce_ops(ops), fence=True)
+                ticket.wait()  # synchronous loads (M1-M3)
                 if self._verify_loads:
                     self._verify_loaded_bytes(ops, sources, engine)
             finally:
                 for store, pages in reserved:
                     store.release_pages(pages)
-            self._finished_recving.add(spec.request_id)
+            # NOTE: sync loads must NOT be reported via finished_recving:
+            # the base contract reserves that channel for async loads, and
+            # the scheduler has no pending-receive state for sync ones — a
+            # late report asserts after the request retires (found by the
+            # M3 soak loop; scheduler.py _update_from_kv_xfer_finished).
 
     def _converted_page(
         self,
@@ -384,16 +448,8 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
                 f"{dst_fp.identity}; cross-layout load refused"
             )
         slot = src_store.pool_slice(page)
-        num_layers = src_store.descriptor.geometry.num_layers
-        page_bytes = src_store.page_bytes
-        for li in range(num_layers):
-            lo = li * page_bytes
-            codec.convert(
-                slot[lo : lo + page_bytes],
-                scratch[lo : lo + page_bytes],
-                src_fp,
-                dst_fp,
-            )
+        # One batched repack for the whole slot (M3: was per-layer).
+        codec.convert(slot, scratch, src_fp, dst_fp)
         runtime.stats_codec_hits += 1
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -409,6 +465,16 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         return  # saves are driven from SaveSpecs in wait_for_save
 
     def wait_for_save(self) -> None:
+        """Submit this step's saves asynchronously (M3).
+
+        The D2H copies run on the private save stream; pages are published
+        — and the request reported finished_sending — only when the ticket
+        completes, polled in `get_transfer_results`. The deferred-free
+        contract keeps the source GPU blocks alive until then, so no
+        synchronize is needed here. This also removes the M2-era
+        "saves need a follow-up engine step" flush workaround ordering:
+        the ticket is checked on every subsequent step.
+        """
         meta = self._get_connector_metadata()
         assert isinstance(meta, OmniKVMetadata)
         runtime = _RUNTIME
@@ -420,13 +486,13 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         store = runtime.stores[runtime.descriptor.fingerprint.identity]
         fingerprint_id = runtime.descriptor.fingerprint.identity
         for spec in meta.saves:
+            self._check_generation(spec.generation, "save spec")
             self._save_one(spec, store, placement, engine, fingerprint_id, runtime)
-            self._finished_sending.add(spec.request_id)
 
     def _save_one(
         self,
         spec: SaveSpec,
-        store: CpuPageStore,
+        store,  # CpuPageStore | SpillStore
         placement: GroupPlacement,
         engine: RegionTransferEngine,
         fingerprint_id: str,
@@ -456,17 +522,26 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
                         )
                     )
                     host_off += size
-            if ops:
-                ticket = engine.submit("d2h", ops, fence=True)
-                ticket.wait()  # synchronous saves
-            for key, page, _ in acquired:
-                store.publish(key, page)
-                runtime.stats_saved += 1
-        except Exception:
+            if not ops:
+                self._finished_sending.add(spec.request_id)
+                return
+            ticket = engine.submit("d2h", coalesce_ops(ops), fence=True)
+            _RUNTIME.pending_saves += 1
+            self._save_tickets[spec.request_id] = _SaveTicket(
+                ticket=ticket,
+                store=store,
+                fingerprint_id=fingerprint_id,
+                acquired=[(k, p) for k, p, _ in acquired],
+            )
+        except Exception:  # noqa: BLE001 - best-effort save by design
+            # Best-effort save semantics (research.md §7.5): a failed save
+            # is a future cache miss, never a request failure. Release the
+            # acquired pages and report the request finished sending.
             for _, page, _ in acquired:
-                if page in store._inflight:
+                if page in getattr(store, "_inflight", ()):
                     store.release(page)
-            raise
+            runtime.stats_save_failures += 1
+            self._finished_sending.add(spec.request_id)
 
     def get_transfer_results(
         self, finished_req_ids: set[str]
@@ -475,6 +550,17 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             KVConnectorTransferResults,
         )
 
+        # Publish completed async saves (readiness-before-visibility:
+        # pages become lookup-visible only after the D2H completes).
+        for req_id, st in list(self._save_tickets.items()):
+            if not st.ticket.ready():
+                continue
+            del self._save_tickets[req_id]
+            _RUNTIME.pending_saves -= 1
+            for key, page in st.acquired:
+                st.store.publish(key, page)
+                _RUNTIME.stats_saved += 1
+            self._finished_sending.add(req_id)
         sending = self._finished_sending & finished_req_ids
         recving = self._finished_recving & finished_req_ids
         self._finished_sending -= sending
@@ -497,11 +583,12 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         if not runtime.ready or not self._eligible(request):
             return 0, False
         # A save accepted by request_finished rides the *next* step's
-        # connector metadata before its pages land in the store. Defer the
-        # lookup (None == "query again later", per the base contract) while
-        # any saves are pending, so a prefix is never missed because its
-        # producer's save has not executed yet.
-        if self._pending_saves:
+        # connector metadata, and its pages publish only when the async
+        # D2H ticket completes. Defer the lookup (None == "query again
+        # later", per the base contract) while any saves are pending or in
+        # flight, so a prefix is never missed because its producer's save
+        # has not landed yet.
+        if self._pending_saves or _RUNTIME.pending_saves:
             return None, False
         bs = self._block_size
         tokens = list(request.all_token_ids)[: request.num_tokens]
@@ -546,7 +633,7 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             runtime.stats_hits += matched
         # Record the exact per-block decisions so the worker consumes them
         # verbatim (no re-derivation between lookup and allocation).
-        self._load_ctx[request.request_id] = (num_computed_tokens, conversions)
+        self._load_ctx[request.request_id] = (num_computed_tokens, conversions, self._steps)
         self._last_match[request.request_id] = (num_computed_tokens, matched * bs)
         return matched * bs, False
 
@@ -569,7 +656,7 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         matched_blocks = num_external_tokens // bs
         group_ids = blocks.get_block_ids()[0]  # single group (M1/M2)
         dst = group_ids[computed_blocks : computed_blocks + matched_blocks]
-        ctx = self._load_ctx.pop(request.request_id, (num_computed, []))
+        ctx = self._load_ctx.pop(request.request_id, (num_computed, [], 0))
         conversions = list(ctx[1][:matched_blocks])
         if len(dst) != matched_blocks or len(conversions) != matched_blocks:
             raise OmniKVError(
@@ -584,6 +671,7 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
                 list(request.all_token_ids)[: request.num_tokens], bs
             )[computed_blocks : computed_blocks + matched_blocks],
             conversions=conversions,
+            generation=_RUNTIME.generation,
         )
         self._last_match.pop(request.request_id, None)
 
@@ -602,9 +690,23 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             if store is not None:
                 store.release_pages([page])
 
+    def _gc_stale_ctx(self) -> None:
+        """Drop lookup contexts whose requests never reached allocation
+        (e.g. preempted between lookup and alloc): their reservations
+        would pin capacity forever. Heuristic age: 100 scheduler steps —
+        far beyond any legitimate lookup->alloc gap (same scheduling
+        pass), small against request lifetimes."""
+        horizon = self._steps - 100
+        for req_id in [
+            rid for rid, ctx in self._load_ctx.items() if ctx[2] <= horizon
+        ]:
+            self._release_ctx(req_id)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        self._steps += 1
+        self._gc_stale_ctx()
         meta = OmniKVMetadata(
             loads=list(self._pending_loads.values()),
             saves=list(self._pending_saves.values()),
@@ -637,6 +739,7 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             request_id=request.request_id,
             src_block_ids=list(block_ids[:full_blocks]),
             hashes=hashes,
+            generation=_RUNTIME.generation,
         )
         return True, None
 
@@ -673,7 +776,8 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         engine: RegionTransferEngine,
     ) -> None:
         """L1 gate: read back the just-written GPU bytes and memcmp the
-        source host bytes (research.md §10)."""
+        source host bytes (research.md §10). M3: torch.equal on one
+        packed read-back buffer (was a per-op .tolist())."""
         total = sum(op.nbytes for op in ops)
         scratch = torch.empty(total, dtype=torch.uint8, pin_memory=True)
         base = scratch.data_ptr()
@@ -689,12 +793,14 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         engine.submit("d2h", readback, fence=False).wait()
         offset = 0
         for op, (src_ptr, _) in zip(ops, sources):
-            got = bytes(scratch[offset : offset + op.nbytes].tolist())
-            offset += op.nbytes
-            want = ctypes.string_at(src_ptr, op.nbytes)
-            if got != want:
+            got = scratch[offset : offset + op.nbytes]
+            want = torch.frombuffer(
+                bytearray(ctypes.string_at(src_ptr, op.nbytes)), dtype=torch.uint8
+            )
+            if not torch.equal(got, want):
                 raise OmniKVError(
                     f"load verification failed: GPU bytes at {hex(op.dst_ptr)} "
                     f"do not match the source page bytes at {hex(src_ptr)} "
                     f"({op.nbytes} B)"
                 )
+            offset += op.nbytes

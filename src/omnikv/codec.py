@@ -89,17 +89,28 @@ class PageCodec:
         fp_src: FormatFingerprint,
         fp_dst: FormatFingerprint,
     ) -> None:
+        """Repack one store page (or a batch of whole pages).
+
+        ``src``/``dst`` must hold an integer number of pages; each page is
+        permuted independently ([N, H, C] <-> [H, N, C]), so a whole slot
+        (layer-major pages) repacks in a single batched copy.
+        """
         n, h, c = self.geometry(fp_src)
-        total = n * h * c
-        if src.numel() != total or dst.numel() != total:
+        page = n * h * c
+        if src.numel() != dst.numel() or src.numel() % page != 0:
             raise CompatibilityError(
                 f"page size mismatch: src={src.numel()} dst={dst.numel()} "
-                f"expected={total}"
+                f"page={page}"
             )
+        batch = src.numel() // page
         if fp_src.layout == "LBNHC":
-            dst.view(h, n, c).copy_(src.view(n, h, c).permute(1, 0, 2))
+            dst.view(batch, h, n, c).copy_(
+                src.view(batch, n, h, c).permute(0, 2, 1, 3)
+            )
         else:
-            dst.view(n, h, c).copy_(src.view(h, n, c).permute(1, 0, 2))
+            dst.view(batch, n, h, c).copy_(
+                src.view(batch, h, n, c).permute(0, 2, 1, 3)
+            )
 
 
 class NhdToHndCodec(PageCodec):

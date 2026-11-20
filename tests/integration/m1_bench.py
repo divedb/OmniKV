@@ -67,3 +67,39 @@ if __name__ == "__main__":
     bench("qwen2.5-1.5b (28x64KiB)", layers=28, page=65536, blocks=256)
     bench("gpt2 (12x192KiB)", layers=12, page=196608, blocks=64)
     bench("gpt2 (12x192KiB)", layers=12, page=196608, blocks=256)
+    # M3: coalesced multi-block batches (what the connector submits after
+    # coalesce_ops) vs the raw per-page submission.
+    from omnikv.transfer.engine import coalesce_ops
+
+    for name, layers, page, blocks in [
+        ("qwen2.5-1.5b", 28, 65536, 64),
+        ("qwen2.5-1.5b", 28, 65536, 256),
+    ]:
+        gpu = torch.empty(layers * blocks * page, dtype=torch.uint8, device="cuda")
+        host = torch.empty(layers * blocks * page, dtype=torch.uint8, pin_memory=True)
+        raw = [
+            PageCopyOp(
+                src_ptr=gpu.data_ptr() + (li * blocks + b) * page,
+                dst_ptr=host.data_ptr() + (b * layers + li) * page,
+                nbytes=page,
+            )
+            for b in range(blocks)
+            for li in range(layers)
+        ]
+        coal = coalesce_ops(list(raw))
+        for label, ops in (("raw", raw), ("coalesced", coal)):
+            engine2 = RegionTransferEngine(device_index=0)
+            engine2.submit("d2h", ops).wait()
+            times = []
+            import time as _t
+
+            for _ in range(5):
+                t0 = _t.perf_counter()
+                engine2.submit("d2h", ops).wait()
+                times.append(_t.perf_counter() - t0)
+            dt = min(times)
+            total = layers * blocks * page
+            print(
+                f"{name} {blocks}blk {label}: {len(ops)} ops, {dt*1e3:.2f} ms "
+                f"({total/dt/2**30:.2f} GiB/s)"
+            )

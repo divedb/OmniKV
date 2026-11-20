@@ -71,6 +71,7 @@ class CpuPageStore:
         descriptor: GroupDescriptor,
         num_pages: int,
         pin_memory: bool = True,
+        on_evict=None,
     ):
         if num_pages <= 0:
             raise ValueError("num_pages must be positive")
@@ -87,6 +88,9 @@ class CpuPageStore:
         self._free: list[int] = list(range(num_pages - 1, -1, -1))
         self._inflight: set[int] = set()
         self._reserved: set[int] = set()
+        # Tiering hook (M3): called with (key, page_index) before an LRU
+        # victim is dropped, so a higher tier can spill it to disk.
+        self.on_evict = on_evict
 
     # -- lookup ---------------------------------------------------------
 
@@ -122,7 +126,8 @@ class CpuPageStore:
         """Reserve a free page slot for an in-flight save.
 
         Evicts the least-recently-used *unreserved* entry when the pool is
-        full. The slot is *not* lookup-visible until `publish`.
+        full, invoking ``on_evict(key, page_index)`` first if set. The
+        slot is *not* lookup-visible until `publish`.
         """
         if not self._free:
             victim_idx = next(
@@ -134,6 +139,8 @@ class CpuPageStore:
                     "in-flight load; increase omnikv.cpu_pages"
                 )
             victim_key = self._index[victim_idx]
+            if self.on_evict is not None:
+                self.on_evict(victim_key, victim_idx)
             del self._lru[victim_key]
             self._index.pop(victim_idx, None)
             self._free.append(victim_idx)
@@ -190,6 +197,34 @@ class CpuPageStore:
     @property
     def reserved_pages(self) -> int:
         return len(self._reserved)
+
+    def audit(self) -> None:
+        """Leak detector (research.md §10 T9): every page must be in
+        exactly one of {free, inflight, lru}; reserved pages must be a
+        subset of lru pages. Raises StoreError on any inconsistency."""
+        free, inflight, lru_pages = (
+            set(self._free),
+            set(self._inflight),
+            set(self._lru.values()),
+        )
+        if free & inflight or free & lru_pages or inflight & lru_pages:
+            raise StoreError(
+                f"page ownership overlap: free={len(free)} "
+                f"inflight={len(inflight)} lru={len(lru_pages)} "
+                f"overlaps={[len(free & inflight), len(free & lru_pages), len(inflight & lru_pages)]}"
+            )
+        if len(free) + len(inflight) + len(lru_pages) != self.num_pages:
+            raise StoreError(
+                f"page count leak: free={len(free)} inflight={len(inflight)} "
+                f"lru={len(lru_pages)} total={self.num_pages}"
+            )
+        if not self._reserved <= lru_pages:
+            raise StoreError(
+                f"{len(self._reserved - lru_pages)} reserved pages are not "
+                "lookup-visible (reservation leak)"
+            )
+        if self._index.keys() != lru_pages:
+            raise StoreError("index/lru page-set mismatch")
 
     def contains(self, key: BlockKey) -> bool:
         return key in self._lru

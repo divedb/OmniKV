@@ -209,3 +209,66 @@ optimization targets: fused repack kernels or direct fragment-mapped H2D
 
 The M1 file passing under the v2 core is the M1-regression gate
 (fingerprint v2 + placement-driven ops changed every code path).
+
+## 2026-11-20 — M3: storage and transfer (async saves, spill tier, hardening)
+
+Scope implemented:
+
+- **Async saves**: `wait_for_save` submits coalesced D2H batches without
+  waiting; `get_transfer_results` publishes pages when tickets complete
+  (readiness-before-visibility preserved) and reports `finished_sending`.
+  `_RUNTIME.pending_saves` gates the scheduler-side lookup deferral.
+- **Hardening** (the M2 issue list): engine **generation guard** (specs
+  carry their generation; workers refuse plans from a superseded engine),
+  stale-lookup **reservation GC** (100-step horizon in
+  `build_connector_meta`), `verify_load_bytes` via `torch.equal` (was
+  `.tolist()`).
+- **Op coalescing** (`coalesce_ops`): merges runs contiguous in both src
+  and dst (unit-tested; see the honest benchmark note below).
+- **Batched codec**: whole-slot repack in one permuted copy (was per-layer).
+- **Disk tier**: `DiskPageStore` (pread/pwrite page file, LRU) +
+  `SpillStore` (hot evictions spill to disk; cold hits promote to hot;
+  `audit()` spans both tiers). Config: `omnikv.spill_dir` /
+  `omnikv.spill_pages`.
+- **Failure plumbing**: best-effort saves — a failed save submission
+  releases its pages, counts `stats_save_failures`, and reports
+  `finished_sending` (a failed save is a future cache miss, never a
+  request failure).
+
+### M3 validation results (all on the remote GPU)
+
+| Gate | Result |
+|---|---|
+| Concurrent reuse (8 requests, 2 prefix families, async saves in flight) | ✅ outputs token-identical to the native-cache control; hits=8 |
+| Soak (30 rounds, hot=4 + spill, per-round audits) | ✅ 30/30 audits clean; hits=28; hot=3 / cold=8 |
+| Failure injection (save submission fails once) | ✅ engine survives, failure counted, audits clean |
+| M1+M2+M3 full matrix | ✅ 6/6 in 390 s |
+| Unit (local / remote) | 66 / 80 passed |
+
+### M3 benchmark + honest gap
+
+Measured ceiling on this host (single 448 MiB pinned copy): **12.2 GiB/s
+d2h / 11.5 GiB/s h2d** (PCIe 3.0 x16 platform). The connector's per-page
+path: 9.45 d2h / 7.78 h2d = **77% / 68% of ceiling**. `coalesce_ops`
+landed with unit tests, but the benchmark shows it merges **nothing** in
+the current store layout: slots are block-major, so per-layer host
+addresses step by `slot_bytes` across blocks — never contiguous.
+Cross-block merging needs request-scoped layer-major staging (FlexKV's
+"block-wise mode"); recorded as the top M4/M5 performance follow-up
+alongside the ≥80% milestone target.
+
+### M3 issues hit and fixes
+
+1. Sync loads must NOT report `finished_recving` (the channel is for
+   async loads; a late report asserts in
+   `_update_from_kv_xfer_finished` after the request retires) — found by
+   the soak loop.
+2. Failure injection targeting: saves are exactly `d2h`+`fence=True`
+   (loads `h2d`, verify read-backs `fence=False`).
+3. Injection window: saves ride the steps of the round AFTER their
+   request (the M2 flush finding) — the patch must stay armed one extra
+   round; the round also needs unique full blocks or the save no-ops.
+4. Spill promotion: `publish` clears the inflight mark (discard-first
+   raised "was not acquired").
+5. Soak pressure: the failed save saves nothing — every round needs a
+   unique tail or distinct blocks never exceed hot capacity.

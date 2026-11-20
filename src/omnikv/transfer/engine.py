@@ -15,7 +15,11 @@ import glob
 import os
 from dataclasses import dataclass
 
-import torch
+try:  # CUDA torch required at runtime; the coalescing logic below is
+    # torch-free and unit-tested locally.
+    import torch
+except ImportError:  # pragma: no cover - local test hosts only
+    torch = None  # type: ignore[assignment]
 
 # cudaMemcpyKind enum values (CUDA runtime).
 _MEMCPY_KIND = {"h2d": 1, "d2h": 2, "d2d": 3}
@@ -28,6 +32,32 @@ class PageCopyOp:
     src_ptr: int
     dst_ptr: int
     nbytes: int
+
+
+def coalesce_ops(ops: list[PageCopyOp]) -> list[PageCopyOp]:
+    """Merge adjacent runs into fewer, larger copies.
+
+    Two ops merge when both their source and destination ranges are
+    contiguous (the whole-block case: consecutive blocks of one layer are
+    contiguous in both the store slots and the engine pool). Mirrors
+    vLLM's offloading `_coalesce_runs` (research.md §2.1.6): a 64-block
+    load collapses from ~layers*blocks ops to ~layers ops.
+    """
+    if len(ops) < 2:
+        return ops
+    ordered = sorted(ops, key=lambda op: op.dst_ptr)
+    out: list[PageCopyOp] = []
+    for op in ordered:
+        prev = out[-1] if out else None
+        if (
+            prev is not None
+            and op.dst_ptr == prev.dst_ptr + prev.nbytes
+            and op.src_ptr == prev.src_ptr + prev.nbytes
+        ):
+            out[-1] = PageCopyOp(prev.src_ptr, prev.dst_ptr, prev.nbytes + op.nbytes)
+        else:
+            out.append(op)
+    return out
 
 
 class TransferTicket:

@@ -10,7 +10,7 @@
 set -euo pipefail
 
 export OMNIKV_HOST="${OMNIKV_HOST:-root@connect.nmb2.seetacloud.com}"
-export OMNIKV_PORT="${OMNIKV_PORT:-44740}"
+export OMNIKV_PORT="${OMNIKV_PORT:-10487}"
 export OMNIKV_DIR="${OMNIKV_DIR:-/root/autodl-tmp/omnikv}"
 
 # Optional per-user overrides (gitignored).

@@ -11,6 +11,7 @@ Append-only; newest entries last.
 | GPU audit | `nvidia-smi --query-gpu=...` | RTX 3080 Ti, 12 GiB, driver 595.71.05, sm_86 |
 | Disk audit | `df -h /root/autodl-tmp` | 50 GB disk, 3.5 GB free (cleanup pending) |
 | Python audit | `ls /root/miniconda3/bin/python3` | 3.12.3 (no PATH in non-interactive SSH) |
+| Instance replaced | `ssh -p 10487 ...` (new endpoint) | fresh 50 GB disk; env rebuilt: venv, vllm 0.34.0, pytest/order/modelscope, editable omnikv |
 | Disk cleanup | `rm -rf FlexKV/ssd_cache FlexKV/ssd_cache2` | 32 GB freed (owner-approved); 35 GB available |
 | uv install (remote) | standalone installer → `~/.local/bin/uv` | uv 0.13.9 |
 | Project sync | `scripts/sync_remote.sh` | `/root/autodl-tmp/omnikv` created (69 KB sent) |

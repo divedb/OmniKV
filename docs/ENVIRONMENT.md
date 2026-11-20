@@ -19,10 +19,17 @@ only; **no credentials are stored in this repository**.
 | GPU | 1 × NVIDIA GeForce RTX 3080 Ti — sm_86 (Ampere), 12 288 MiB VRAM |
 | Driver | 595.71.05 |
 | CUDA toolkit (system) | 12.8 (`/usr/local/cuda-12.8`) |
-| CPU / RAM | 80 cores / 125 GiB (96 GiB available) |
-| Data disk `/root/autodl-tmp` | 50 GB (see constraints below) |
+| CPU / RAM | 80 cores / 125 GiB |
+| Data disk `/root/autodl-tmp` | 50 GB |
 | Python (system conda) | 3.12.3 (`/root/miniconda3`) |
 | Network | China-region host: use Tsinghua PyPI mirror + ModelScope |
+
+> Endpoint note: the instance was replaced on 2026-11-20 (new SSH port,
+> see `scripts/remote_env.sh`). The replacement started with an **empty
+> data disk** — the environment (venv, vLLM stack, models) was rebuilt
+> from this repository's scripts and the recorded install commands in
+> `docs/TESTLOG.md`. Connection details live only in `scripts/remote_env.sh`
+> (defaults) and the gitignored `scripts/remote.env`; key-based SSH only.
 
 ## Existing remote artifacts (do not disturb)
 

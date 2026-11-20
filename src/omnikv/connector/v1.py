@@ -286,8 +286,21 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             ops: list[PageCopyOp] = []
             sources: list[tuple[int, int]] = []  # (host_ptr, nbytes) per op
             reserved: list[tuple[CpuPageStore, list[int]]] = []
-            scratch = None
+            # One combined scratch for all codec-converted blocks of this
+            # load: ops reference distinct per-block regions that stay valid
+            # until the single submit+wait below.
+            n_converted = sum(1 for c in spec.conversions if c[0])
+            scratch = (
+                torch.empty(
+                    n_converted * primary.slot_bytes,
+                    dtype=torch.uint8,
+                    pin_memory=True,
+                )
+                if n_converted
+                else None
+            )
             try:
+                scratch_off = 0
                 for i, (block_id, block_hash) in enumerate(
                     zip(spec.dst_block_ids, spec.hashes)
                 ):
@@ -307,10 +320,15 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
                             reserved.append((primary, [page]))
                         else:
                             src_store = runtime.stores[src_fp_id]
-                            scratch = self._converted_page(
-                                src_store, page, fingerprint, scratch
+                            assert scratch is not None
+                            self._converted_page(
+                                src_store,
+                                page,
+                                fingerprint,
+                                scratch[scratch_off : scratch_off + src_store.slot_bytes],
                             )
-                            host_base = scratch.data_ptr()
+                            host_base = scratch.data_ptr() + scratch_off
+                            scratch_off += src_store.slot_bytes
                             reserved.append((src_store, [page]))
                     else:
                         page = primary.page_of(
@@ -349,9 +367,14 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         src_store: CpuPageStore,
         page: int,
         dst_fp: FormatFingerprint,
-        scratch,  # torch.Tensor | None (reused across blocks of one load)
+        scratch,  # torch.Tensor: the destination region for this block
     ):
-        """Repack one foreign-fingerprint store page into ``dst_fp``."""
+        """Repack one foreign-fingerprint store page into ``dst_fp``.
+
+        The codec's unit is ONE layer's page; a store slot holds the
+        group's layer-major pages, so each layer's slice is repacked into
+        the matching slice of the destination region.
+        """
         runtime = _RUNTIME
         src_fp = src_store.descriptor.fingerprint
         codec = runtime.registry.find(src_fp, dst_fp)
@@ -360,18 +383,18 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
                 f"no registered codec for {src_fp.identity} -> "
                 f"{dst_fp.identity}; cross-layout load refused"
             )
-        if scratch is None:
-            scratch = torch.empty(
-                src_store.slot_bytes, dtype=torch.uint8, pin_memory=True
+        slot = src_store.pool_slice(page)
+        num_layers = src_store.descriptor.geometry.num_layers
+        page_bytes = src_store.page_bytes
+        for li in range(num_layers):
+            lo = li * page_bytes
+            codec.convert(
+                slot[lo : lo + page_bytes],
+                scratch[lo : lo + page_bytes],
+                src_fp,
+                dst_fp,
             )
-        codec.convert(
-            src_store.pool_slice(page),
-            scratch[: src_store.slot_bytes],
-            src_fp,
-            dst_fp,
-        )
         runtime.stats_codec_hits += 1
-        return scratch
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return  # loads complete synchronously in start_load_kv

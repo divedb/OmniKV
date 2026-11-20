@@ -25,7 +25,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
 import os
 import sys
@@ -120,9 +119,18 @@ def main() -> None:
     from omnikv.connector import v1 as connector_module
 
     if args.mode == "save":
-        atexit.register(connector_module.dump_runtime_stores, args.store)
         out = llm.generate([PREFIX + SUFFIX_A], sp)[0]
         result = {"mode": "save", "outputs": {"a": serialize(out)}}
+        # Deferred-free saves ride the NEXT engine step's metadata (M1
+        # finding): with no follow-up request the D2H would never run
+        # before process exit. Force a flush step, then dump.
+        llm.generate(["flush"], SamplingParams(temperature=0.0, max_tokens=1))
+        connector_module.dump_runtime_stores(args.store)
+        runtime = connector_module._RUNTIME
+        result["stats"] = {
+            "saved": runtime.stats_saved,
+            "stores": sorted(runtime.stores),
+        }
     else:
         out = llm.generate([PREFIX + SUFFIX_B], sp)[0]
         runtime = connector_module._RUNTIME

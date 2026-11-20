@@ -153,15 +153,14 @@ def main() -> None:
         result["outputs"]["b"] = serialize(out)
         if connector_module is not None:
             runtime = connector_module._RUNTIME
+            stores = runtime.stores
             result["stats"] = {
                 "after_save": stats_after_save,
                 "final": {
                     "saved": runtime.stats_saved,
                     "hits": runtime.stats_hits,
-                    "store_len": len(runtime.store) if runtime.store else 0,
-                    "free_pages": (
-                        runtime.store.free_pages if runtime.store else 0
-                    ),
+                    "store_len": sum(len(s) for s in stores.values()),
+                    "free_pages": sum(s.free_pages for s in stores.values()),
                 },
             }
 

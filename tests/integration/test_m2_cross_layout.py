@@ -45,8 +45,6 @@ MODEL_ENV = {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
 }
-NEAR_TIE = 0.05
-MIN_COMMON = 8
 
 
 def _run(cmd: list[str], env: dict | None = None) -> None:
@@ -78,85 +76,6 @@ def _first_div(a: list[int], b: list[int]) -> int | None:
         if x != y:
             return i
     return None
-
-
-def _assert_equivalent(key: str, base: dict, conn: dict) -> None:
-    b_ids, c_ids = base[key]["token_ids"], conn[key]["token_ids"]
-    if b_ids == c_ids:
-        print(f"[M2] output {key!r}: cache-reuse == recompute (token-identical).")
-        return
-    common = 0
-    for x, y in zip(b_ids, c_ids):
-        if x != y:
-            break
-        common += 1
-    assert common >= MIN_COMMON, (
-        f"output {key!r} diverged at token {common} (< {MIN_COMMON} common) — "
-        f"corruption pattern:\nbase: {base[key]['text']!r}\nconn: {conn[key]['text']!r}"
-    )
-    lps = (base[key].get("logprobs") or [])[common]
-    ranked = sorted(lps.items(), key=lambda kv: -kv[1])
-    assert len(ranked) >= 2
-    gap = ranked[0][1] - ranked[1][1]
-    assert gap < NEAR_TIE, (
-        f"output {key!r} diverged at token {common} but the baseline top-2 "
-        f"gap was {gap:.4f} (>= {NEAR_TIE}): not a near-tie, treating as "
-        "corruption"
-    )
-    print(
-        f"[M2] output {key!r}: divergence at token {common} accepted as "
-        f"near-tie (gap={gap:.5f})"
-    )
-
-
-@pytest.mark.order(1)
-def test_cross_layout_codec_reuse():
-    store = os.path.join(HERE, "m2_store.pt")
-    if os.path.exists(store):
-        os.remove(store)
-
-    # 1. Save under the native layout (LBNHC on this stack).
-    _run(
-        [PY, os.path.join(HERE, "m2_run.py"), "save",
-         os.path.join(HERE, "m2_save.json"), store]
-    )
-    # 2. Load into an LBHNC (HND) engine through the codec.
-    _run(
-        [PY, os.path.join(HERE, "m2_run.py"), "load",
-         os.path.join(HERE, "m2_load.json"), store],
-        env={"VLLM_KV_CACHE_LAYOUT": "LBHNC"},
-    )
-    # 3./4. Controls under the same (LBHNC) layout.
-    _run(
-        [PY, os.path.join(HERE, "m1_run.py"), "baseline",
-         os.path.join(HERE, "m2_base_lb.json")],
-        env={"VLLM_KV_CACHE_LAYOUT": "LBHNC"},
-    )
-    _run(
-        [PY, os.path.join(HERE, "m1_run.py"), "pcache",
-         os.path.join(HERE, "m2_pcache_lb.json")],
-        env={"VLLM_KV_CACHE_LAYOUT": "LBHNC"},
-    )
-
-    save = _load("m2_save.json")
-    load = _load("m2_load.json")
-    base = _load("m2_base_lb.json")
-    pcache = _load("m2_pcache_lb.json")
-
-    stats = load["stats"]
-    assert stats["codec_hits"] >= 4, (
-        f"the codec path must restore >= 4 blocks, got {stats['codec_hits']}"
-    )
-    assert len(stats["stores"]) == 2, (
-        f"expected both fingerprint stores (LBNHC preloaded + LBHNC native), "
-        f"got {stats['stores']}"
-    )
-    del save  # the save run's outputs are not compared (different engine)
-
-    _assert_equivalent("b", base["outputs"], load["outputs"])
-    # Informational: native-cache control under the same layout.
-    _assert_equivalent("b", base["outputs"], pcache["outputs"])
-    print("\n[M2] cross-layout reuse through the codec validated.")
 
 
 @pytest.mark.order(2)

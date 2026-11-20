@@ -136,3 +136,61 @@ batching target (research.md §8.2).
   machinery in M3 (where preemption actually races in-flight transfers).
 - Per-step connector overhead at ≥128 concurrent requests: needs the
   concurrency harness; deferred to M3 alongside async loads.
+
+## 2026-11-20 — M2: layout abstraction hardening (instance 2, port 10487)
+
+Scope implemented (v2 core):
+
+- `types.py` v2: `FormatFingerprint.page_fragments` (store-page interior
+  structure; identity includes it), `LayerAddress`/`GroupPlacement`
+  (fragment-decomposed GPU addressing; per-layer storages; component
+  labels for separate K/V), `FORMAT_VERSION = 2`.
+- `adapter/vllm.py`: certification of the registered views' **element**
+  strides against the layout permutation at kernel-block granularity
+  (ratio derived from metadata); placement for all six layout families
+  incl. per-head-fragmented LHBNC/BHLNC; worker per-layer-tensor form;
+  dim-0 padding; mixed per-layer specs rejected (value-based identity).
+- `codec.py`: `PageCodec`/`CodecRegistry` with the NHD<->HND store-page
+  row permutation (torch views, host-side); `swap_layout` for alternate
+  fingerprint keys; absent codec = hard `CompatibilityError`.
+- `connector/v1.py`: per-fingerprint stores; re-registrable placement
+  (sequential engines share stores in-process); `cross_layout` lookup
+  routing through the codec registry; per-block scratch for converted
+  pages; store persistence (`dump_runtime_stores`/`load_runtime_stores`,
+  `omnikv.preload_store`).
+- `detect.py`: detection-tier stride certification with ambiguity
+  rejection (N==H both-readings case raises without a hint).
+
+### M2 validation results
+
+| Gate | Result |
+|---|---|
+| Unit conformance (local torch-free + remote torch-backed) | 56 local / 67 remote passed |
+| Codec exactness | repack == reference permutation; round-trip identity (3 seeds) |
+| Detection ambiguity | N==H dual-reading raises; hint resolves; dim-0 pad rejected |
+| **Cross-layout E2E** (LBNHC save → LBHNC engine, codec load) | **codec_hits=4; cross-B == native-LBHNC-pcache-B token-identical; both diverge from recompute at token 19 (established reuse drift)** |
+| Bitwise L1 read-back | enabled in all connector runs; passed |
+
+### M2 benchmark (`tests/integration/m2_bench.py`)
+
+28-page slot (1.8 MiB): repack 709 µs (2.41 GiB/s) vs memcpy 19 µs
+(92 GiB/s) — **codec overhead ×38**. For reference, H2D of the same slot
+is ~230 µs, so a converted block costs ~3× its transfer time. M3+
+optimization targets: fused repack kernels or direct fragment-mapped H2D
+(eliminating the scratch copy).
+
+### M2 issues hit and fixes
+
+1. Engine views are dtype-typed: torch strides are ELEMENTS —
+   certification moved to element units (byte addressing via stride×elem).
+2. Kernel-block splits: registered views carry (num_blocks×ratio, H,
+   block_size/ratio, C); ratio derived from metadata, manager-block
+   addressing = ratio × view stride.
+3. Deferred-free saves need a subsequent engine step: the save-mode
+   runner now forces a flush request before dumping stores.
+4. Codec unit is one layer page, not a store slot: `_converted_page`
+   repacks per layer.
+5. Buffer-lifetime bug: one scratch reused across blocks while ops were
+   batched for a single submit — every block read the last repack. Fixed
+   with a combined per-block-offset scratch (caught by the output gate
+   reproducing degenerate repetition).

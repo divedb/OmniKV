@@ -1,0 +1,117 @@
+{
+  "matrix_version": 1,
+  "omnikv_format_version": 3,
+  "generated": "2026-11-21",
+  "validated_environment": {
+    "vllm": ["0.34.0"],
+    "torch": ["2.14.0+cu130"],
+    "gpu": ["RTX 3080 Ti (sm_86), single GPU, in-process scheduler+worker"],
+    "notes": "The adapter dual-form reads both the v0.34.0 release KVCacheGroupSpec and main's post-#61452 form (unit-validated); the second-engine validation runs are recorded in docs/TESTLOG.md."
+  },
+  "status_legend": {
+    "supported": "implemented and validated end-to-end on the recorded environment",
+    "passthrough": "byte-copy without reinterpretation, gated by fingerprint equality",
+    "rejected": "registration fails closed with an explicit error",
+    "partial": "implemented with the stated limits; not all combinations validated",
+    "unsupported": "not implemented; lookups miss or registration fails by design"
+  },
+  "state_kinds": {
+    "paged_kv": {
+      "status": "supported",
+      "evidence": "M1-M3: Qwen2.5-1.5B GQA and gpt2 MHA, LBNHC/LBHNC, token-identical to native prefix-cache reuse; 128-request concurrency (M5)"
+    },
+    "latent_kv": {
+      "status": "supported",
+      "evidence": "M4: tiny DeepSeek-V2 MLA with real vLLM kernels, token/hidden/logprob-exact vs native reuse",
+      "limits": ["head_size_v must equal head_size (diff-KV rejected)", "same-format reuse only"]
+    },
+    "sliding_window_kv": {
+      "status": "supported",
+      "evidence": "M4: Gemma-2-2B-IT hybrid; 4,352-token shared prefix beyond the 4,096-token window restores the live trailing window",
+      "limits": ["restore trims to the trailing window interval", "manager trim policy assumed (research.md Q1)"]
+    },
+    "recurrent_state": {
+      "status": "rejected",
+      "evidence": "M4 no-go spike: align-mode boundary CoW snapshots are not observable from the request-finished lifecycle (docs/M4.md)",
+      "notes": "fail-closed at registration, including recurrent groups inside hybrid engines"
+    },
+    "sparse_index": {
+      "status": "partial",
+      "evidence": "M4: explicit indexer-role metadata, opaque passthrough validated on CUDA fixtures",
+      "limits": ["no full DeepSeek-V4 model run"]
+    },
+    "aux_state": {
+      "status": "unsupported",
+      "notes": "scratch/per-request rings excluded from transfer by design"
+    }
+  },
+  "layouts": {
+    "LBNHC": {"status": "supported", "evidence": "default engine layout across M1-M5 model runs"},
+    "LBHNC": {"status": "supported", "evidence": "M1 engine run; M2 codec cross-load LBNHC->LBHNC"},
+    "LHBNC": {"status": "supported", "evidence": "M2 unit + M5 GPU fuzz golden-offset validation", "limits": ["unpadded pages only", "kernel splits keep per-head runs contiguous (validated)"]},
+    "BLNHC": {"status": "supported", "evidence": "M2 unit conformance + M5 GPU fuzz", "limits": ["ratio-1 kernel blocks only"]},
+    "BLHNC": {"status": "supported", "evidence": "M2 unit conformance + M5 GPU fuzz", "limits": ["ratio-1 kernel blocks only"]},
+    "BHLNC": {"status": "supported", "evidence": "M2 unit conformance + M5 GPU fuzz", "limits": ["ratio-1 kernel blocks only"]}
+  },
+  "kernel_block_splits": {
+    "ratio_1": {"status": "supported", "notes": "the common case across all model runs"},
+    "ratio_gt1_layer_compact": {"status": "supported", "evidence": "LBNHC/LBHNC/LHBNC unit + GPU fuzz"},
+    "ratio_gt1_block_outermost": {
+      "status": "rejected",
+      "evidence": "M5 fail-closed: a manager block's kernel rows sit L*row apart, so single-run per-block addressing would copy interleaved bytes silently",
+      "notes": "closed silent-corruption path found while building the M5 golden-offset fuzz"
+    }
+  },
+  "quantization": {
+    "NONE": {"status": "passthrough", "notes": "raw byte copies under fingerprint equality"},
+    "FP8_PER_TENSOR": {
+      "status": "supported",
+      "evidence": "M4: Gemma-2-2B FP8 KV hybrid, exact vs native reuse",
+      "limits": ["checkpoint scales only (dynamic calibration rejected)", "scales captured immutably into the fingerprint; mutation after registration fails closed"]
+    },
+    "FP8_PER_TOKEN_HEAD": {"status": "passthrough", "limits": ["requires explicit inline state_content_bytes"]},
+    "INT8_PER_TOKEN_HEAD": {"status": "passthrough", "limits": ["requires explicit inline state_content_bytes"]},
+    "INT4_PER_TOKEN_HEAD": {"status": "passthrough", "limits": ["requires explicit inline state_content_bytes"]},
+    "NVFP4_DS_MLA": {"status": "passthrough", "limits": ["descriptor tests only; no model run"]},
+    "other_modes": {"status": "rejected", "notes": "no certified scale contract; registration fails closed"}
+  },
+  "codecs": {
+    "NHD_HND_repack": {
+      "status": "supported",
+      "evidence": "M2: LBNHC-saved pages restored into an LBHNC engine, token-identical to that engine's native reuse",
+      "limits": ["unquantized, unpadded PAGED_KV only"]
+    },
+    "all_other_pairs": {"status": "unsupported", "notes": "absent codec = hard CompatibilityError (fail closed)"}
+  },
+  "storage": {
+    "cpu_pinned_pool": {"status": "supported", "notes": "fixed-capacity LRU pool, one per fingerprint; M5 shared pinned scratch slots for conversions/read-backs"},
+    "disk_spill_tier": {"status": "supported", "evidence": "M3 soak + M5 100-round soak"},
+    "remote_store": {"status": "unsupported", "notes": "no remote tier implemented"},
+    "canonical_store_policy": {"status": "unsupported", "notes": "passthrough-with-fingerprint only (research.md design C)"}
+  },
+  "transfer": {
+    "sync_loads": {"status": "supported", "notes": "loads complete inside start_load_kv; wait_for_layer_load is a no-op"},
+    "async_saves": {"status": "supported", "evidence": "M3/M5: publish-on-completion, deferred free"},
+    "pitched_2d_copies": {"status": "supported", "evidence": "M5 bench: byte-equality gated on-GPU"},
+    "layerwise_pipelined_loads": {"status": "unsupported", "notes": "wait_for_layer_load is a no-op (synchronous loads)"},
+    "distributed_pd_disagg": {"status": "unsupported", "notes": "no NIXL/Mooncake backends"},
+    "multi_process_scheduler_worker": {"status": "unsupported", "notes": "single in-process runtime; cross-process store handoff via dump/preload only"}
+  },
+  "identity_and_correctness": {
+    "per_group_block_keys": {"status": "supported", "evidence": "fingerprint identity + chained block hashes; group/model/layer namespace (v3)"},
+    "fp8_scale_capture": {"status": "supported", "evidence": "M4: scale mutation/identity unit tests + FP8 hybrid model run"},
+    "lora_multimodal_requests": {"status": "unsupported", "notes": "excluded from caching (eligible() gate) until extra-key hashing lands"},
+    "partial_blocks": {"status": "rejected", "notes": "only full blocks are saved or restored"},
+    "mixed_per_layer_formats_in_group": {"status": "rejected", "notes": "value-based spec identity check at registration"},
+    "dim0_padding": {"status": "supported", "evidence": "unit + GPU fuzz (per-layer tensor form)"},
+    "padded_kernel_split_pages": {"status": "rejected", "notes": "uncertified interior padding at split granularity"},
+    "padded_head_fragmented_pages": {"status": "rejected", "notes": "fragment sums must equal the unpadded page payload"}
+  },
+  "known_limitations": [
+    "Single GPU, single process; no TP/DCP/PCP sharding or replica writer election",
+    "Loads are synchronous (inside start_load_kv); async loads are future work",
+    "Codec overhead: NHD<->HND repack is a host-side torch permutation (~x38 vs memcpy at the M2 geometry)",
+    "heads-outermost layouts transfer as per-head fragment runs (correct, more ops)",
+    "no cross-engine reuse beyond the registered NHD<->HND codec; different fingerprints miss"
+  ]
+}

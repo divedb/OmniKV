@@ -6,6 +6,13 @@ CUDA stream and completed with a single event. M1 waits on the ticket
 before results become visible (publish / forward), which keeps the
 correctness rules trivially satisfied while the async machinery (streams,
 events, batching) is already in place for M3.
+
+M5 adds pitched 2-D copies (`PageCopy2DOp` via `cudaMemcpy2DAsync`) and
+`plan_batch`, which folds regularly-strided op sequences into single 2-D
+copies — the cross-block merging the M3 audit showed plain coalescing
+cannot do (store slots are block-major while layer-compact engine pools
+are layer-major, so a B-block x L-layer batch submits as ~B pitched copies
+instead of B*L memcpys).
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ from __future__ import annotations
 import ctypes
 import glob
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 try:  # CUDA torch required at runtime; the coalescing logic below is
@@ -32,6 +40,33 @@ class PageCopyOp:
     src_ptr: int
     dst_ptr: int
     nbytes: int
+
+
+@dataclass(frozen=True)
+class PageCopy2DOp:
+    """One pitched 2-D copy: ``height`` rows of ``width`` bytes each.
+
+    Row ``i`` spans ``[src_ptr + i*src_pitch, +width)`` at the source and
+    ``[dst_ptr + i*dst_pitch, +width)`` at the destination. Backed by
+    ``cudaMemcpy2DAsync``; pitches must be >= width (rows may not overlap).
+    """
+
+    src_ptr: int
+    dst_ptr: int
+    width: int
+    height: int
+    src_pitch: int
+    dst_pitch: int
+
+    def __post_init__(self) -> None:
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("width and height must be positive")
+        if self.src_pitch < self.width or self.dst_pitch < self.width:
+            raise ValueError("pitches must be >= width (rows must not overlap)")
+
+    @property
+    def nbytes(self) -> int:
+        return self.width * self.height
 
 
 def coalesce_ops(ops: list[PageCopyOp]) -> list[PageCopyOp]:
@@ -57,6 +92,67 @@ def coalesce_ops(ops: list[PageCopyOp]) -> list[PageCopyOp]:
             out[-1] = PageCopyOp(prev.src_ptr, prev.dst_ptr, prev.nbytes + op.nbytes)
         else:
             out.append(op)
+    return out
+
+
+def plan_batch(ops: list[PageCopyOp]) -> list[PageCopyOp | PageCopy2DOp]:
+    """Coalesce contiguous runs, then fold regular stride patterns into
+    pitched 2-D copies (research.md §8.5 "pinned copy2d").
+
+    A maximal chain of equal-sized ops whose consecutive source and
+    destination pointers advance by constant strides becomes ONE
+    `PageCopy2DOp`. Fully-contiguous chains were already merged by
+    `coalesce_ops`, so every fold here is a genuine submission-count win:
+
+    - block-major store saves (layer-compact engine): per block, the L
+      layer pages are contiguous in the store slot but strided by
+      ``layer_stride`` on the GPU -> one 2-D op of height L per block;
+    - loads with consecutive GPU blocks and consecutive store pages: per
+      layer, B block pages are contiguous on the GPU but one slot apart
+      in the store -> one 2-D op of height B per layer.
+    """
+    coalesced = coalesce_ops(ops)
+    if len(coalesced) < 2:
+        # list-invariance workaround: the values are valid union members.
+        import typing
+
+        return typing.cast("list[PageCopyOp | PageCopy2DOp]", list(coalesced))
+    ordered = sorted(coalesced, key=lambda op: op.dst_ptr)
+    out: list[PageCopyOp | PageCopy2DOp] = []
+    i = 0
+    while i < len(ordered):
+        first = ordered[i]
+        j = i + 1
+        src_pitch = dst_pitch = 0
+        height = 1
+        while j < len(ordered):
+            cand = ordered[j]
+            if cand.nbytes != first.nbytes:
+                break
+            step_src = cand.src_ptr - ordered[j - 1].src_ptr
+            step_dst = cand.dst_ptr - ordered[j - 1].dst_ptr
+            if step_src < first.nbytes or step_dst < first.nbytes:
+                break  # overlapping or backward rows: not a legal pitch
+            if src_pitch == 0:
+                src_pitch, dst_pitch = step_src, step_dst
+            elif (step_src, step_dst) != (src_pitch, dst_pitch):
+                break
+            height += 1
+            j += 1
+        if height > 1:
+            out.append(
+                PageCopy2DOp(
+                    src_ptr=first.src_ptr,
+                    dst_ptr=first.dst_ptr,
+                    width=first.nbytes,
+                    height=height,
+                    src_pitch=src_pitch,
+                    dst_pitch=dst_pitch,
+                )
+            )
+        else:
+            out.append(first)
+        i = j
     return out
 
 
@@ -104,19 +200,36 @@ class RegionTransferEngine:
             ctypes.c_int,
             ctypes.c_void_p,
         ]
+        self._memcpy2d = self._cudart.cudaMemcpy2DAsync
+        self._memcpy2d.restype = ctypes.c_int
+        self._memcpy2d.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
         self._errstr = self._cudart.cudaGetErrorString
         self._errstr.restype = ctypes.c_char_p
         self._copies_submitted = 0
         self._bytes_submitted = 0
 
     def submit(
-        self, direction: str, ops: list[PageCopyOp], *, fence: bool = True
+        self,
+        direction: str,
+        ops: Sequence[PageCopyOp | PageCopy2DOp],
+        *,
+        fence: bool = True,
     ) -> TransferTicket:
         """Enqueue one batch; the returned ticket must be waited on.
 
         Args:
             direction: "h2d" (host -> GPU) or "d2h" (GPU -> host).
-            ops: contiguous copies; pointers must remain valid until wait().
+            ops: contiguous `PageCopyOp` and/or pitched `PageCopy2DOp`
+                copies; pointers must remain valid until wait().
             fence: order the batch after the caller's current stream.
         """
         if direction not in _MEMCPY_KIND or direction == "d2d":
@@ -129,13 +242,25 @@ class RegionTransferEngine:
             if fence:
                 stream.wait_stream(current)
             for op in ops:
-                rc = self._memcpy(
-                    ctypes.c_void_p(op.dst_ptr),
-                    ctypes.c_void_p(op.src_ptr),
-                    ctypes.c_size_t(op.nbytes),
-                    _MEMCPY_KIND[direction],
-                    ctypes.c_void_p(stream.cuda_stream),
-                )
+                if isinstance(op, PageCopy2DOp):
+                    rc = self._memcpy2d(
+                        ctypes.c_void_p(op.dst_ptr),
+                        ctypes.c_size_t(op.dst_pitch),
+                        ctypes.c_void_p(op.src_ptr),
+                        ctypes.c_size_t(op.src_pitch),
+                        ctypes.c_size_t(op.width),
+                        ctypes.c_size_t(op.height),
+                        _MEMCPY_KIND[direction],
+                        ctypes.c_void_p(stream.cuda_stream),
+                    )
+                else:
+                    rc = self._memcpy(
+                        ctypes.c_void_p(op.dst_ptr),
+                        ctypes.c_void_p(op.src_ptr),
+                        ctypes.c_size_t(op.nbytes),
+                        _MEMCPY_KIND[direction],
+                        ctypes.c_void_p(stream.cuda_stream),
+                    )
                 if rc != 0:
                     raise RuntimeError(
                         f"cudaMemcpyAsync failed ({rc}): "

@@ -1,7 +1,7 @@
 [project]
 name = "omnikv"
 version = "0.1.0"
-description = "Layout-agnostic KV cache system for vLLM (M1: PAGED_KV passthrough)"
+description = "Layout-agnostic KV cache system for vLLM (M5: validation and optimization)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []

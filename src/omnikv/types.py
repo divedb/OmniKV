@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
+from fractions import Fraction
 
 
 class StateKind(Enum):
@@ -44,9 +45,10 @@ LAYOUT_FAMILIES = frozenset(
 )
 
 # Bump on any change to fingerprint derivation or run semantics.
+# v3: semantic geometry, group/model namespace and captured FP8 scale identity.
 # v2: adds `page_fragments` (store-page interior structure) — pages saved
 # under v1 fingerprints are not compatible (different identity namespace).
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,8 @@ class FormatFingerprint:
     scale_layout: str | None
     page_fragments: tuple[int, ...] = ()
     version: int = FORMAT_VERSION
+    semantic_geometry: tuple = ()
+    namespace: tuple = ()
 
     def __post_init__(self) -> None:
         if self.layout not in LAYOUT_FAMILIES:
@@ -110,6 +114,8 @@ class FormatFingerprint:
                 self.scale_layout,
                 self.page_fragments,
                 self.version,
+                self.semantic_geometry,
+                self.namespace,
             )
         )
         return hashlib.blake2b(payload.encode(), digest_size=8).hexdigest()
@@ -121,9 +127,10 @@ class StateSemantics:
 
     kind: StateKind
     block_size: int
-    tokens_per_state: float
+    tokens_per_state: int | Fraction
     slots_per_block: int
     window_tokens: int | None = None
+    extra_retained_tokens: int = 0
     prefix_cacheable: bool = True
     dcp_sharded: bool = False
     tp_replicated: bool = False

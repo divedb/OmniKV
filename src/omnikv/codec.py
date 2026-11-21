@@ -52,10 +52,15 @@ class PageCodec:
     def convertible(self, src: FormatFingerprint, dst: FormatFingerprint) -> bool:
         if (src.layout, dst.layout) != (self.src_layout, self.dst_layout):
             return False
-        if src.state_kind is not StateKind.PAGED_KV:
+        if src.state_kind is not StateKind.PAGED_KV or src.quant != "NONE":
             return False
         if dst.state_kind is not src.state_kind:
             return False
+        if src.semantic_geometry and (
+            src.page_bytes[0]
+            != src.head_geometry[0] * src.head_geometry[3] * src.semantic_geometry[3]
+        ):
+            return False  # aligned padding is not part of a token-row permutation
         return (
             src.dtype == dst.dtype
             and src.quant == dst.quant
@@ -63,6 +68,8 @@ class PageCodec:
             and src.page_bytes == dst.page_bytes
             and src.scale_layout == dst.scale_layout
             and src.version == dst.version
+            and src.semantic_geometry == dst.semantic_geometry
+            and src.namespace == dst.namespace
         )
 
     def geometry(self, fp: FormatFingerprint) -> tuple[int, int, int]:
@@ -99,18 +106,13 @@ class PageCodec:
         page = n * h * c
         if src.numel() != dst.numel() or src.numel() % page != 0:
             raise CompatibilityError(
-                f"page size mismatch: src={src.numel()} dst={dst.numel()} "
-                f"page={page}"
+                f"page size mismatch: src={src.numel()} dst={dst.numel()} page={page}"
             )
         batch = src.numel() // page
         if fp_src.layout == "LBNHC":
-            dst.view(batch, h, n, c).copy_(
-                src.view(batch, n, h, c).permute(0, 2, 1, 3)
-            )
+            dst.view(batch, h, n, c).copy_(src.view(batch, n, h, c).permute(0, 2, 1, 3))
         else:
-            dst.view(batch, n, h, c).copy_(
-                src.view(batch, h, n, c).permute(0, 2, 1, 3)
-            )
+            dst.view(batch, n, h, c).copy_(src.view(batch, h, n, c).permute(0, 2, 1, 3))
 
 
 class NhdToHndCodec(PageCodec):
@@ -146,9 +148,7 @@ class CodecRegistry:
     def register(self, codec: PageCodec) -> None:
         self._codecs[CodecKey(codec.src_layout, codec.dst_layout)] = codec
 
-    def find(
-        self, src: FormatFingerprint, dst: FormatFingerprint
-    ) -> PageCodec | None:
+    def find(self, src: FormatFingerprint, dst: FormatFingerprint) -> PageCodec | None:
         codec = self._codecs.get(CodecKey(src.layout, dst.layout))
         if codec is not None and codec.convertible(src, dst):
             return codec

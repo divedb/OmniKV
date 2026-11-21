@@ -54,6 +54,7 @@ class _Pool:
     def data_ptr(self) -> int:
         if self._tensor is not None:
             return self._tensor.data_ptr()
+        assert self._buf is not None
         return ctypes.addressof(self._buf)
 
 
@@ -88,6 +89,7 @@ class CpuPageStore:
         self._free: list[int] = list(range(num_pages - 1, -1, -1))
         self._inflight: set[int] = set()
         self._reserved: set[int] = set()
+        self._reservation_counts: dict[int, int] = {}
         # Tiering hook (M3): called with (key, page_index) before an LRU
         # victim is dropped, so a higher tier can spill it to disk.
         self.on_evict = on_evict
@@ -114,11 +116,19 @@ class CpuPageStore:
 
     def reserve_pages(self, pages: list[int]) -> None:
         """Pin pages against eviction (scheduler lookup -> worker copy)."""
-        self._reserved.update(pages)
+        for page in pages:
+            self._reservation_counts[page] = self._reservation_counts.get(page, 0) + 1
+            self._reserved.add(page)
 
     def release_pages(self, pages: list[int]) -> None:
         """Drop reservations after the copy completed (or was abandoned)."""
-        self._reserved.difference_update(pages)
+        for page in pages:
+            count = self._reservation_counts.get(page, 0)
+            if count <= 1:
+                self._reservation_counts.pop(page, None)
+                self._reserved.discard(page)
+            else:
+                self._reservation_counts[page] = count - 1
 
     # -- publish / evict -------------------------------------------------
 

@@ -1,4 +1,4 @@
-"""OmniKV V1 connector for vLLM (M2: layout-agnostic + cross-layout reuse).
+"""OmniKV V1 connector for vLLM (M4: semantic multi-group cache reuse).
 
 Implements `KVConnectorBase_V1` against the v0.34.0 contract:
 
@@ -13,7 +13,7 @@ Implements `KVConnectorBase_V1` against the v0.34.0 contract:
 - Store pages hit by a scheduler lookup are reserved against eviction
   until their H2D copy lands (ownership epochs, research.md §7.4).
 
-M2 additions:
+Layout and semantic behavior:
 - Transfers are placement-driven (`GroupPlacement.gpu_ops`), so fragmented
   pages (LHBNC/BHLNC) move as per-head runs without core changes.
 - One store per `FormatFingerprint` identity; with ``omnikv.cross_layout``
@@ -23,6 +23,11 @@ M2 additions:
 - The runtime survives engine re-registration in-process (sequential
   engines with different layouts share the stores — the M2 cross-layout
   validation topology).
+
+M4 adds independent group plans, trailing-window lookup, HMA completion
+aggregation, model/layer namespaces and immutable per-tensor FP8 scale capture.
+The scheduler and worker still share one in-process runtime; this is not a
+distributed cache directory. Recurrent states remain explicitly unsupported.
 
 Configuration (``kv_connector_extra_config``):
   - ``omnikv.cpu_pages``: store capacity in blocks per fingerprint.
@@ -34,7 +39,9 @@ Configuration (``kv_connector_extra_config``):
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
+from math import lcm
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -42,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 
 if TYPE_CHECKING:
@@ -51,21 +59,21 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
 from omnikv.adapter.vllm import VllmLayoutAdapter
 from omnikv.codec import DEFAULT_REGISTRY, CodecRegistry
 from omnikv.errors import CompatibilityError, OmniKVError, StoreError
-from omnikv.keys import BlockKey, chain_block_hashes
+from omnikv.keys import BlockKey, chain_block_hashes, extend_block_hashes
+from omnikv.semantics import required_blocks
 from omnikv.store.cpu import CpuPageStore
 from omnikv.transfer.engine import (
     PageCopyOp,
     RegionTransferEngine,
-    coalesce_ops,
+    plan_batch,
 )
-from omnikv.types import FormatFingerprint, GroupPlacement
+from omnikv.types import FormatFingerprint, GroupDescriptor, GroupPlacement
 
 try:  # present in 0.34.0; guarded for forward compatibility
     from vllm.v1.metrics.cache_hit_source import CacheHitSource
@@ -82,13 +90,14 @@ class LoadSpec:
     request_id: str
     dst_block_ids: list[int]
     hashes: list[bytes]
-    # Non-empty: pages come from other-fingerprint stores, converted by the
-    # codec. Parallel to dst_block_ids/hashes: (store_fingerprint_id, page).
+    # Reserved source pages, parallel to dst_block_ids/hashes. Explicit
+    # source identities also permit safe cleanup of stale-generation plans.
     conversions: list[tuple[str, int]] = field(default_factory=list)
     # Engine generation at build time; the worker refuses to execute plans
     # from a superseded engine (M3 hardening: two live engines must never
     # share placement).
     generation: int = 0
+    group_id: int = 0
 
 
 @dataclass
@@ -99,6 +108,7 @@ class SaveSpec:
     src_block_ids: list[int]
     hashes: list[bytes]
     generation: int = 0
+    group_id: int = 0
 
 
 @dataclass
@@ -130,9 +140,11 @@ class _Runtime:
     """
 
     def __init__(self, registry: CodecRegistry | None = None) -> None:
-        self.descriptor = None  # GroupDescriptor of the current engine
+        self.descriptors: dict[int, GroupDescriptor] = {}
+        self.placements: dict[int, GroupPlacement] = {}
+        self.descriptor: GroupDescriptor | None = None  # GroupDescriptor of the current engine
         self.placement: GroupPlacement | None = None
-        self.stores: dict[str, CpuPageStore] = {}
+        self.stores: dict[str, Any] = {}
         self.engine: RegionTransferEngine | None = None
         self.registry = registry or DEFAULT_REGISTRY
         # Bumped on every register_kv_caches; specs carry the generation
@@ -143,10 +155,32 @@ class _Runtime:
         # a prefix is never missed because its producer's D2H has not
         # completed (readiness-before-visibility, research.md §7.4).
         self.pending_saves = 0
+        # M5: shared pinned scratch buffers, grown on demand. Repeated
+        # cudaHostAlloc in the load/verify path costs milliseconds per step;
+        # each use is transient within one synchronous call. Two named
+        # slots: the L1 read-back gate must never reallocate the buffer
+        # that a live conversion's source pointers still point into.
+        self._scratch: dict[str, Any] = {}
         self.stats_hits = 0
         self.stats_codec_hits = 0
         self.stats_saved = 0
         self.stats_save_failures = 0
+
+    def pinned_scratch(self, nbytes: int, slot: str = "convert"):
+        """A pinned uint8 scratch view of at least ``nbytes`` (M5).
+
+        Grows geometrically; a returned view is only valid until the next
+        call on the same slot (single-threaded engine hot path).
+        """
+        import torch as _torch
+
+        buf = self._scratch.get(slot)
+        current = 0 if buf is None else buf.numel()
+        if current < nbytes:
+            buf = _torch.empty(max(nbytes, 2 * current), dtype=_torch.uint8, pin_memory=True)
+            self._scratch[slot] = buf
+        assert buf is not None
+        return buf[:nbytes]
 
     @property
     def ready(self) -> bool:
@@ -159,7 +193,7 @@ class _Runtime:
         if store is None:
             assert self.descriptor is not None
             descriptor = GroupDescriptor(
-                group_id=0,
+                group_id=self.descriptor.group_id,
                 semantics=self.descriptor.semantics,
                 fingerprint=fingerprint,
                 geometry=self.descriptor.geometry,
@@ -244,8 +278,8 @@ def load_runtime_stores(path: str) -> None:
         _RUNTIME.stores[fp_id] = store
 
 
-class OmniKVConnectorV1(KVConnectorBase_V1):
-    """M2 connector: CPU offload/reload of full-attention blocks."""
+class OmniKVConnectorV1(KVConnectorBase_V1, SupportsHMA):
+    """CPU/SSD offload of full, latent, windowed and sparse-index groups."""
 
     _cache_hit_source = _HOST_HIT_SOURCE
 
@@ -262,6 +296,9 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         if spec is None:
             spec = next(iter(groups[0].kv_cache_specs.values()))
         self._block_size = spec.block_size
+        self._vllm_config = vllm_config
+        self._group_ctx: dict[str, tuple[int, dict, int]] = {}
+        self._loaded_groups: dict[str, tuple[int, ...]] = {}
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         self._num_pages = int(extra.get("omnikv.cpu_pages", 1024))
         self._save_enabled = bool(extra.get("omnikv.save_enabled", True))
@@ -273,15 +310,22 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         self._spill_pages = int(extra.get("omnikv.spill_pages", 4096))
         # Scheduler-role bookkeeping.
         self._last_match: dict[str, tuple[int, int]] = {}
-        self._load_ctx: dict[str, tuple[int, list[tuple[str, int]], int]] = {}
-        self._pending_loads: dict[str, LoadSpec] = {}
-        self._pending_saves: dict[str, SaveSpec] = {}
+        self._pending_loads: dict[tuple[str, int], LoadSpec] = {}
+        self._pending_saves: dict[tuple[str, int], SaveSpec] = {}
         self._steps = 0
+        # M5: per-request block-hash chains, keyed (request_id, block_size).
+        # get_num_new_matched_tokens is re-queried every step while lookups
+        # are deferred (the None contract), and request_finished hashes the
+        # grown token list again; all_token_ids is append-only, so cached
+        # chains extend instead of recomputing (research.md §8.6: hash the
+        # prefix once per request per lookup-group).
+        self._hash_chains: dict[tuple[str, int], tuple[int, list[bytes]]] = {}
+        self._hash_steps: dict[str, int] = {}
         # Worker-role completion state: async save tickets keyed by request
         # id, each carrying what to publish when the D2H completes.
         self._finished_sending: set[str] = set()
         self._finished_recving: set[str] = set()
-        self._save_tickets: dict[str, _SaveTicket] = {}
+        self._save_tickets: dict[tuple[str, int], _SaveTicket] = {}
 
     # ------------------------------------------------------------------
     # Worker side
@@ -289,22 +333,76 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         adapter = VllmLayoutAdapter()
-        descriptor = adapter.describe(kv_caches, self._kv_cache_config)[0]
-        assert adapter.last_placement is not None
-        _RUNTIME.descriptor = descriptor
-        _RUNTIME.placement = adapter.last_placement
+        descriptors = adapter.describe(kv_caches, self._kv_cache_config)
+        if not descriptors:
+            raise OmniKVError("no transferable groups")
+        namespace = (
+            str(getattr(self._vllm_config.model_config, "model", "")),
+            str(getattr(self._vllm_config.model_config, "revision", "")),
+        )
+        self._scale_layers = {}
+        self._scale_values = {}
+        self._scale_versions = {}
+        resolved = {}
+        for desc in descriptors:
+            scale_layout = None
+            if desc.fingerprint.quant == "FP8_PER_TENSOR":
+                context = self._vllm_config.compilation_config.static_forward_context
+                values = []
+                for name in desc.geometry.layer_names:
+                    layer = context[name]
+                    if getattr(layer, "calculate_kv_scales", False):
+                        raise OmniKVError("dynamic per-tensor FP8 scales are unsupported")
+                    scales = tuple(
+                        float(getattr(layer, attr).item()) for attr in ("_k_scale", "_v_scale")
+                    )
+                    if not all(math.isfinite(v) and v > 0 for v in scales):
+                        raise OmniKVError("invalid per-tensor FP8 scales")
+                    self._scale_layers[name] = layer
+                    self._scale_values[name] = scales
+                    self._scale_versions[name] = self._scale_stamp(layer)
+                    values.append((name, scales, self._scale_stamp(layer)[2:]))
+                # Captured checkpoint scales are part of compatibility: never
+                # overwrite a global scale while other requests use that layer.
+                scale_layout = repr(tuple(values))
+            fp = replace(
+                desc.fingerprint,
+                scale_layout=scale_layout,
+                namespace=namespace + (desc.group_id, desc.geometry.layer_names),
+            )
+            resolved[desc.group_id] = replace(desc, fingerprint=fp)
+        _RUNTIME.descriptors = resolved
+        _RUNTIME.placements = adapter.placements
         _RUNTIME.generation += 1
-        # Create (or reuse, across sequential engines) the store for this
-        # fingerprint. Store pages are host memory keyed by fingerprint, so
-        # they persist independently of the current engine's GPU addresses.
-        _RUNTIME.store_for(descriptor.fingerprint, self._num_pages)
-        if self._spill_dir:
-            self._install_spill(descriptor.fingerprint)
+        for gid, desc in resolved.items():
+            self._activate_group(gid)
+            _RUNTIME.store_for(desc.fingerprint, self._num_pages)
+            if self._spill_dir:
+                self._install_spill(desc.fingerprint)
+        self._activate_group(next(iter(resolved)))
         if _RUNTIME.engine is None:
             _RUNTIME.engine = RegionTransferEngine(device_index=adapter.device_index)
         if self._preload_store and not self._preloaded:
             load_runtime_stores(self._preload_store)
             self._preloaded = True
+
+    def _activate_group(self, gid: int) -> None:
+        _RUNTIME.descriptor = _RUNTIME.descriptors[gid]
+        _RUNTIME.placement = _RUNTIME.placements[gid]
+
+    @staticmethod
+    def _scale_stamp(layer):
+        # Tensor mutation versions avoid a device-to-host synchronization in
+        # the transfer hot path. Replacement and in-place updates invalidate
+        # the captured checkpoint scale namespace.
+        return tuple(
+            (id(getattr(layer, a)), getattr(layer, a)._version) for a in ("_k_scale", "_v_scale")
+        ) + tuple(getattr(layer, a, None) for a in ("_k_scale_float", "_v_scale_float"))
+
+    def _check_scales(self) -> None:
+        for name, layer in getattr(self, "_scale_layers", {}).items():
+            if self._scale_stamp(layer) != self._scale_versions[name]:
+                raise OmniKVError(f"FP8 scales changed after registration: {name}")
 
     def _install_spill(self, fingerprint) -> None:
         """Wrap the fingerprint's hot store with a disk spill tier."""
@@ -328,103 +426,77 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
                 "must never execute against the current placement"
             )
 
-    def start_load_kv(
-        self, forward_context: ForwardContext, **kwargs: Any
-    ) -> None:
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         meta = self._get_connector_metadata()
         assert isinstance(meta, OmniKVMetadata)
+        # All groups belong to one synchronous load transaction. Even if
+        # the first group's generation/scale/copy check fails, release every
+        # reservation, including groups whose copies never started.
+        try:
+            self._load_batches(meta)
+        finally:
+            for spec in meta.loads:
+                for fp_id, page in spec.conversions:
+                    _RUNTIME.stores[fp_id].release_pages([page])
+
+    def _load_batches(self, meta: OmniKVMetadata) -> None:
         runtime = _RUNTIME
         if not runtime.ready:
             raise OmniKVError("worker load before registration")
         engine = runtime.engine
         assert engine is not None
-        placement = runtime.placement
-        fingerprint = runtime.descriptor.fingerprint
-        primary = runtime.stores[fingerprint.identity]
+        self._check_scales()
         for spec in meta.loads:
+            self._check_generation(spec.generation, "transfer spec")
+            self._activate_group(spec.group_id)
+            placement = runtime.placements[spec.group_id]
+            fingerprint = runtime.descriptors[spec.group_id].fingerprint
+            primary = runtime.stores[fingerprint.identity]
             self._check_generation(spec.generation, "load spec")
             ops: list[PageCopyOp] = []
             sources: list[tuple[int, int]] = []  # (host_ptr, nbytes) per op
-            reserved: list[tuple[CpuPageStore, list[int]]] = []
-            # One combined scratch for all codec-converted blocks of this
-            # load: ops reference distinct per-block regions that stay valid
-            # until the single submit+wait below.
-            n_converted = sum(1 for c in spec.conversions if c[0])
-            scratch = (
-                torch.empty(
-                    n_converted * primary.slot_bytes,
-                    dtype=torch.uint8,
-                    pin_memory=True,
-                )
-                if n_converted
-                else None
-            )
-            try:
-                scratch_off = 0
-                for i, (block_id, block_hash) in enumerate(
-                    zip(spec.dst_block_ids, spec.hashes)
-                ):
-                    if i < len(spec.conversions):
-                        src_fp_id, page = spec.conversions[i]
-                        if src_fp_id == "":
-                            page = primary.page_of(
-                                BlockKey(fingerprint.identity, block_hash)
-                            )
-                            if page is None:
-                                raise OmniKVError(
-                                    f"load for {spec.request_id!r} missed its "
-                                    "reserved store page; refusing unverified "
-                                    "bytes"
-                                )
-                            host_base = primary.page_ptr(page)
-                            reserved.append((primary, [page]))
-                        else:
-                            src_store = runtime.stores[src_fp_id]
-                            assert scratch is not None
-                            self._converted_page(
-                                src_store,
-                                page,
-                                fingerprint,
-                                scratch[scratch_off : scratch_off + src_store.slot_bytes],
-                            )
-                            host_base = scratch.data_ptr() + scratch_off
-                            scratch_off += src_store.slot_bytes
-                            reserved.append((src_store, [page]))
-                    else:
-                        page = primary.page_of(
-                            BlockKey(fingerprint.identity, block_hash)
+            if len(spec.conversions) != len(spec.hashes):
+                raise OmniKVError("load lacks complete reservation metadata")
+            n_converted = sum(f != fingerprint.identity for f, _ in spec.conversions)
+            scratch = None
+            if n_converted:
+                scratch = runtime.pinned_scratch(n_converted * primary.slot_bytes)
+            scratch_off = 0
+            for block_id, block_hash, (source_id, page) in zip(
+                spec.dst_block_ids, spec.hashes, spec.conversions, strict=True
+            ):
+                store = runtime.stores[source_id]
+                key = BlockKey(source_id, block_hash)
+                if store.page_of(key) != page:
+                    raise OmniKVError("load missed its reserved store page")
+                host_base = store.page_ptr(page)
+                if source_id != fingerprint.identity:
+                    assert scratch is not None
+                    self._converted_page(
+                        store,
+                        page,
+                        fingerprint,
+                        scratch[scratch_off : scratch_off + primary.slot_bytes],
+                    )
+                    host_base = scratch.data_ptr() + scratch_off
+                    scratch_off += primary.slot_bytes
+                host_off = 0
+                for gpu_ptr, size in placement.gpu_ops(block_id):
+                    ops.append(
+                        PageCopyOp(
+                            src_ptr=host_base + host_off,
+                            dst_ptr=gpu_ptr,
+                            nbytes=size,
                         )
-                        if page is None:
-                            raise OmniKVError(
-                                f"load for request {spec.request_id!r} missed "
-                                "its reserved store page; refusing "
-                                "unverified bytes"
-                            )
-                        host_base = primary.page_ptr(page)
-                        reserved.append((primary, [page]))
-                    host_off = 0
-                    for gpu_ptr, size in placement.gpu_ops(block_id):
-                        ops.append(
-                            PageCopyOp(
-                                src_ptr=host_base + host_off,
-                                dst_ptr=gpu_ptr,
-                                nbytes=size,
-                            )
-                        )
-                        sources.append((host_base + host_off, size))
-                        host_off += size
-                ticket = engine.submit("h2d", coalesce_ops(ops), fence=True)
-                ticket.wait()  # synchronous loads (M1-M3)
-                if self._verify_loads:
-                    self._verify_loaded_bytes(ops, sources, engine)
-            finally:
-                for store, pages in reserved:
-                    store.release_pages(pages)
-            # NOTE: sync loads must NOT be reported via finished_recving:
-            # the base contract reserves that channel for async loads, and
-            # the scheduler has no pending-receive state for sync ones — a
-            # late report asserts after the request retires (found by the
-            # M3 soak loop; scheduler.py _update_from_kv_xfer_finished).
+                    )
+                    sources.append((host_base + host_off, size))
+                    host_off += size
+            if not ops:
+                continue  # e.g. window=1 has no past state to restore
+            ticket = engine.submit("h2d", plan_batch(ops), fence=True)
+            ticket.wait()  # synchronous loads (M1-M3)
+            if self._verify_loads:
+                self._verify_loaded_bytes(ops, sources, engine)
 
     def _converted_page(
         self,
@@ -482,10 +554,13 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             raise OmniKVError("worker save before registration")
         engine = runtime.engine
         assert engine is not None
-        placement = runtime.placement
-        store = runtime.stores[runtime.descriptor.fingerprint.identity]
-        fingerprint_id = runtime.descriptor.fingerprint.identity
+        self._check_scales()
         for spec in meta.saves:
+            self._check_generation(spec.generation, "transfer spec")
+            self._activate_group(spec.group_id)
+            placement = runtime.placements[spec.group_id]
+            fingerprint_id = runtime.descriptors[spec.group_id].fingerprint.identity
+            store = runtime.stores[fingerprint_id]
             self._check_generation(spec.generation, "save spec")
             self._save_one(spec, store, placement, engine, fingerprint_id, runtime)
 
@@ -525,9 +600,9 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             if not ops:
                 self._finished_sending.add(spec.request_id)
                 return
-            ticket = engine.submit("d2h", coalesce_ops(ops), fence=True)
+            ticket = engine.submit("d2h", plan_batch(ops), fence=True)
             _RUNTIME.pending_saves += 1
-            self._save_tickets[spec.request_id] = _SaveTicket(
+            self._save_tickets[(spec.request_id, spec.group_id)] = _SaveTicket(
                 ticket=ticket,
                 store=store,
                 fingerprint_id=fingerprint_id,
@@ -543,9 +618,7 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             runtime.stats_save_failures += 1
             self._finished_sending.add(spec.request_id)
 
-    def get_transfer_results(
-        self, finished_req_ids: set[str]
-    ) -> KVConnectorTransferResults:
+    def get_transfer_results(self, finished_req_ids: set[str]) -> KVConnectorTransferResults:
         from vllm.distributed.kv_transfer.kv_connector.v1.base import (
             KVConnectorTransferResults,
         )
@@ -560,8 +633,9 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
             for key, page in st.acquired:
                 st.store.publish(key, page)
                 _RUNTIME.stats_saved += 1
-            self._finished_sending.add(req_id)
-        sending = self._finished_sending & finished_req_ids
+            self._finished_sending.add(req_id[0])
+        inflight = {key[0] for key in self._save_tickets}
+        sending = (self._finished_sending & finished_req_ids) - inflight
         recving = self._finished_recving & finished_req_ids
         self._finished_sending -= sending
         self._finished_recving -= recving
@@ -580,131 +654,125 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         runtime = _RUNTIME
+        self._release_ctx(request.request_id)
+        self._loaded_groups.pop(request.request_id, None)
         if not runtime.ready or not self._eligible(request):
             return 0, False
-        # A save accepted by request_finished rides the *next* step's
-        # connector metadata, and its pages publish only when the async
-        # D2H ticket completes. Defer the lookup (None == "query again
-        # later", per the base contract) while any saves are pending or in
-        # flight, so a prefix is never missed because its producer's save
-        # has not landed yet.
-        if self._pending_saves or _RUNTIME.pending_saves:
+        if self._pending_saves or runtime.pending_saves:
             return None, False
-        bs = self._block_size
+        descs = runtime.descriptors
+        alignment = lcm(*(d.semantics.block_size for d in descs.values()))
         tokens = list(request.all_token_ids)[: request.num_tokens]
-        max_blocks = (len(tokens) - 1) // bs  # keep >= 1 token to compute
-        computed_blocks = num_computed_tokens // bs
-        matched = 0
-        conversions: list[tuple[str, int]] = []
-        if max_blocks > computed_blocks:
-            hashes = chain_block_hashes(tokens, bs)[computed_blocks:max_blocks]
-            fingerprint = runtime.descriptor.fingerprint
-            primary = runtime.stores[fingerprint.identity]
-            for block_hash in hashes:
-                key = BlockKey(fingerprint.identity, block_hash)
-                page = primary.page_of(key)
-                if page is not None:
-                    primary.reserve_pages([page])
-                    primary.touch(key)
-                    conversions.append(("", page))
-                    matched += 1
-                    continue
-                if not self._cross_layout:
-                    break
-                # Codec path: consult convertible fingerprints' stores.
-                found = False
-                for src_fp in runtime.registry.source_fingerprints_for(
-                    fingerprint
-                ):
-                    src_store = runtime.stores.get(src_fp.identity)
-                    if src_store is None:
-                        continue
-                    src_key = BlockKey(src_fp.identity, block_hash)
-                    page = src_store.page_of(src_key)
-                    if page is not None:
-                        src_store.reserve_pages([page])
-                        src_store.touch(src_key)
-                        conversions.append((src_fp.identity, page))
-                        found = True
+        hashes = self._chains(request.request_id, tokens)
+        # Search from the longest boundary: a window group need not contain
+        # early pages, so a left-to-right prefix scan is incorrect.
+        for boundary in range(
+            (len(tokens) - 1) // alignment * alignment, num_computed_tokens, -alignment
+        ):
+            plan = {}
+            complete = True
+            for gid, desc in descs.items():
+                fp = desc.fingerprint
+                entries = []
+                for index in required_blocks(desc.semantics, boundary, num_computed_tokens):
+                    candidates = [fp]
+                    if self._cross_layout:
+                        candidates += runtime.registry.source_fingerprints_for(fp)
+                    found = None
+                    for source in candidates:
+                        store = runtime.stores.get(source.identity)
+                        if store is None:
+                            continue
+                        key = BlockKey(source.identity, hashes[gid][index])
+                        page = store.page_of(key)
+                        if page is not None:
+                            # Reserve during probing: disk promotion of a later
+                            # page can otherwise evict an earlier candidate.
+                            store.reserve_pages([page])
+                            store.touch(key)
+                            found = (index, source.identity, page, hashes[gid][index])
+                            break
+                    if found is None:
+                        complete = False
                         break
-                if not found:
+                    entries.append(found)
+                plan[gid] = entries
+                if not complete:
                     break
-                matched += 1
-            runtime.stats_hits += matched
-        # Record the exact per-block decisions so the worker consumes them
-        # verbatim (no re-derivation between lookup and allocation).
-        self._load_ctx[request.request_id] = (num_computed_tokens, conversions, self._steps)
-        self._last_match[request.request_id] = (num_computed_tokens, matched * bs)
-        return matched * bs, False
+            if complete:
+                self._group_ctx[request.request_id] = (boundary, plan, self._steps)
+                self._loaded_groups[request.request_id] = tuple(descs)
+                self._last_match[request.request_id] = (
+                    num_computed_tokens,
+                    boundary - num_computed_tokens,
+                )
+                runtime.stats_hits += sum(len(entries) for entries in plan.values())
+                return boundary - num_computed_tokens, False
+            self._release_plan(plan)
+        return 0, False
 
-    def update_state_after_alloc(
-        self,
-        request: Request,
-        blocks: KVCacheBlocks,
-        num_external_tokens: int,
-    ) -> None:
-        if num_external_tokens == 0:
+    @staticmethod
+    def _release_plan(plan) -> None:
+        for entries in plan.values():
+            for _, fp_id, page, _ in entries:
+                _RUNTIME.stores[fp_id].release_pages([page])
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens) -> None:
+        if not num_external_tokens:
             self._release_ctx(request.request_id)
-            self._last_match.pop(request.request_id, None)
+            self._loaded_groups.pop(request.request_id, None)
             return
-        bs = self._block_size
-        num_computed = self._last_match.get(
-            request.request_id,
-            (request.num_computed_tokens - num_external_tokens, 0),
-        )[0]
-        computed_blocks = num_computed // bs
-        matched_blocks = num_external_tokens // bs
-        group_ids = blocks.get_block_ids()[0]  # single group (M1/M2)
-        dst = group_ids[computed_blocks : computed_blocks + matched_blocks]
-        ctx = self._load_ctx.pop(request.request_id, (num_computed, [], 0))
-        conversions = list(ctx[1][:matched_blocks])
-        if len(dst) != matched_blocks or len(conversions) != matched_blocks:
-            raise OmniKVError(
-                f"allocation/bookkeeping mismatch for {request.request_id!r}: "
-                f"dst={len(dst)} conversions={len(conversions)} "
-                f"matched={matched_blocks}"
-            )
-        self._pending_loads[request.request_id] = LoadSpec(
-            request_id=request.request_id,
-            dst_block_ids=list(dst),
-            hashes=chain_block_hashes(
-                list(request.all_token_ids)[: request.num_tokens], bs
-            )[computed_blocks : computed_blocks + matched_blocks],
-            conversions=conversions,
-            generation=_RUNTIME.generation,
-        )
-        self._last_match.pop(request.request_id, None)
+        ctx = self._group_ctx.pop(request.request_id, None)
+        if ctx is None:
+            raise OmniKVError("allocation without reserved group lookup")
+        _boundary, plan, _ = ctx
+        expected = self._last_match.pop(request.request_id)
+        if num_external_tokens != expected[1]:
+            self._release_plan(plan)
+            raise OmniKVError("allocation token count differs from reserved lookup")
+        ids = blocks.get_block_ids()
+        pending = []
+        try:
+            for gid, entries in plan.items():
+                dst = [ids[gid][i] for i, _, _, _ in entries]
+                if any(b <= 0 for b in dst):
+                    raise OmniKVError("live restore range contains a null block")
+                pending.append(
+                    LoadSpec(
+                        request_id=request.request_id,
+                        dst_block_ids=dst,
+                        hashes=[entry[3] for entry in entries],
+                        conversions=[(f, p) for _, f, p, _ in entries],
+                        generation=_RUNTIME.generation,
+                        group_id=gid,
+                    )
+                )
+        except Exception:
+            self._release_plan(plan)
+            raise
+        for spec in pending:
+            self._pending_loads[(request.request_id, spec.group_id)] = spec
 
     def _release_ctx(self, request_id: str) -> None:
-        """Release reservations for a lookup that never became a load."""
-        ctx = self._load_ctx.pop(request_id, None)
-        if ctx is None:
-            return
-        runtime = _RUNTIME
-        for fp_id, page in ctx[1]:
-            store = runtime.stores.get(fp_id) if fp_id else (
-                runtime.stores.get(runtime.descriptor.fingerprint.identity)
-                if runtime.descriptor
-                else None
-            )
-            if store is not None:
-                store.release_pages([page])
+        ctx = self._group_ctx.pop(request_id, None)
+        if ctx is not None:
+            self._release_plan(ctx[1])
+        self._last_match.pop(request_id, None)
 
     def _gc_stale_ctx(self) -> None:
-        """Drop lookup contexts whose requests never reached allocation
-        (e.g. preempted between lookup and alloc): their reservations
-        would pin capacity forever. Heuristic age: 100 scheduler steps —
-        far beyond any legitimate lookup->alloc gap (same scheduling
-        pass), small against request lifetimes."""
-        horizon = self._steps - 100
-        for req_id in [
-            rid for rid, ctx in self._load_ctx.items() if ctx[2] <= horizon
+        for rid in [rid for rid, ctx in self._group_ctx.items() if ctx[2] <= self._steps - 100]:
+            self._release_ctx(rid)
+            self._loaded_groups.pop(rid, None)
+        for rid in [
+            rid for rid, step in self._hash_steps.items() if step <= self._steps - 100
         ]:
-            self._release_ctx(req_id)
+            # Abandoned requests (never finished): their chains are stale.
+            self._drop_chains(rid)
 
-    def build_connector_meta(
-        self, scheduler_output: SchedulerOutput
-    ) -> KVConnectorMetadata:
+    def get_loaded_kv_cache_group_ids(self, request) -> tuple[int, ...]:
+        return self._loaded_groups.get(request.request_id, ())
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         self._steps += 1
         self._gc_stale_ctx()
         meta = OmniKVMetadata(
@@ -720,28 +788,54 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
         request: Request,
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        return self.request_finished_all_groups(request, (block_ids,))
+
+    def request_finished_all_groups(self, request, block_ids):
         self._release_ctx(request.request_id)
-        self._last_match.pop(request.request_id, None)
-        if not self._save_enabled or not self._eligible(request):
-            return False, None
-        if not request.is_finished():
-            return False, None
-        reason = request.get_finished_reason()
-        if reason is not None and int(reason) >= 2:  # aborted
-            return False, None
-        bs = self._block_size
-        tokens = list(request.all_token_ids)
-        full_blocks = len(tokens) // bs
-        if full_blocks == 0 or not block_ids:
-            return False, None
-        hashes = chain_block_hashes(tokens, bs)[:full_blocks]
-        self._pending_saves[request.request_id] = SaveSpec(
-            request_id=request.request_id,
-            src_block_ids=list(block_ids[:full_blocks]),
-            hashes=hashes,
-            generation=_RUNTIME.generation,
-        )
-        return True, None
+        self._loaded_groups.pop(request.request_id, None)
+        # Called exactly once per request: its hash chains die with it.
+        try:
+            if (
+                not self._save_enabled
+                or not self._eligible(request)
+                or not request.is_finished()
+            ):
+                return False, None
+            reason = request.get_finished_reason()
+            if reason is not None and int(reason) >= 2:
+                return False, None
+            tokens = list(request.all_token_ids)
+            # The last sampled token may not have run through the model yet.
+            computed = min(len(tokens), request.num_computed_tokens)
+            chains = self._chains(request.request_id, tokens)
+            queued = False
+            for gid, desc in _RUNTIME.descriptors.items():
+                bs = desc.semantics.block_size
+                hashes = chains[gid]
+                boundary = computed // bs * bs
+                entries = [
+                    (i, block_ids[gid][i])
+                    for i in required_blocks(desc.semantics, boundary)
+                    if i < len(block_ids[gid]) and block_ids[gid][i] > 0
+                ]
+                if not entries:
+                    continue
+                self._pending_saves[(request.request_id, gid)] = SaveSpec(
+                    request_id=request.request_id,
+                    src_block_ids=[b for _, b in entries],
+                    hashes=[hashes[i] for i, _ in entries],
+                    generation=_RUNTIME.generation,
+                    group_id=gid,
+                )
+                queued = True
+            return queued, None
+        finally:
+            self._drop_chains(request.request_id)
+
+    def _drop_chains(self, request_id: str) -> None:
+        self._hash_steps.pop(request_id, None)
+        for key in [k for k in self._hash_chains if k[0] == request_id]:
+            del self._hash_chains[key]
 
     # ------------------------------------------------------------------
     # Capability surface
@@ -758,6 +852,36 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _chains(self, request_id: str, tokens: list[int]) -> dict[int, list[bytes]]:
+        """Per-group block-hash chains for one request's token prefix,
+        memoized and extended across scheduler re-queries (M5).
+
+        Valid because chained block hashes are prefix-stable and a
+        request's ``all_token_ids`` only ever appends.
+        """
+        out: dict[int, list[bytes]] = {}
+        for gid, desc in _RUNTIME.descriptors.items():
+            bs = desc.semantics.block_size
+            key = (request_id, bs)
+            need = len(tokens) // bs
+            cached = self._hash_chains.get(key)
+            if cached is not None and cached[0] >= need:
+                out[gid] = cached[1][:need]
+                continue
+            if cached is not None:
+                hashes = cached[1] + extend_block_hashes(
+                    cached[1][-1] if cached[1] else b"",
+                    cached[0],
+                    tokens,
+                    bs,
+                )
+            else:
+                hashes = chain_block_hashes(tokens, bs)
+            self._hash_chains[key] = (len(hashes), hashes)
+            out[gid] = hashes
+        self._hash_steps[request_id] = self._steps
+        return out
 
     @staticmethod
     def _eligible(request: Request) -> bool:
@@ -777,18 +901,16 @@ class OmniKVConnectorV1(KVConnectorBase_V1):
     ) -> None:
         """L1 gate: read back the just-written GPU bytes and memcmp the
         source host bytes (research.md §10). M3: torch.equal on one
-        packed read-back buffer (was a per-op .tolist())."""
+        packed read-back buffer (was a per-op .tolist()). M5: the read-back
+        buffer is a runtime pinned scratch slot, not a per-load
+        cudaHostAlloc."""
         total = sum(op.nbytes for op in ops)
-        scratch = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+        scratch = _RUNTIME.pinned_scratch(total, slot="verify")
         base = scratch.data_ptr()
         offset = 0
         readback: list[PageCopyOp] = []
         for op in ops:
-            readback.append(
-                PageCopyOp(
-                    src_ptr=op.dst_ptr, dst_ptr=base + offset, nbytes=op.nbytes
-                )
-            )
+            readback.append(PageCopyOp(src_ptr=op.dst_ptr, dst_ptr=base + offset, nbytes=op.nbytes))
             offset += op.nbytes
         engine.submit("d2h", readback, fence=False).wait()
         offset = 0

@@ -272,3 +272,181 @@ alongside the ≥80% milestone target.
    raised "was not acquired").
 5. Soak pressure: the failed save saves nothing — every round needs a
    unique tail or distinct blocks never exceed hot capacity.
+
+## 2026-11-21 — M4 advanced representations
+
+All source edits were made locally and rsynced to
+`/root/autodl-tmp/omnikv` before remote execution. Environment remains
+vLLM 0.34.0, torch 2.14.0+cu130, RTX 3080 Ti (12 GB). Implementation and
+explicit support boundaries: [M4.md](M4.md). Machine-readable comparison
+and transfer results: [m4_results.json](m4_results.json).
+
+### Correctness results
+
+- Local: `pytest tests/unit -q` — **86 passed, 15 skipped** (torch/vLLM/CUDA
+  unavailable locally). Ruff passed. `mypy src/omnikv
+  --ignore-missing-imports --no-warn-unused-ignores` passed; the latter flag
+  suppresses existing optional-torch import-ignore warnings on this host.
+- Remote unit suite: **109 passed**. Includes multi-group hits/misses,
+  different group block sizes, repeated/concurrent reservations, null
+  destinations, incomplete computed tails, aggregated completion, cleanup
+  after group-load failure, and changed FP8 scale rejection.
+- CUDA T10 fixtures: **5 passed**. Padded and compressed latent pages restore
+  byte-exactly into fresh poisoned buffers and reproduce projected latent
+  continuation hidden states. HMA overlay test restores one group's owned
+  block without changing another group's block.
+- Existing M2/M3 suites:
+  `pytest tests/integration/test_m2_cross_layout.py
+  tests/integration/test_m3_async_concurrency.py -q` — **4 passed in 387.44 s**.
+  Covers NHD→HND reuse, concurrent reuse, spill/eviction soak and injected
+  save failure. The existing Qwen M1 connector runner also completed.
+
+Fresh-engine model comparisons use `m4_run.py` in `connector`, `baseline`
+(full recomputation) and `pcache` (native reuse) modes, followed by
+`m4_compare.py`. Each request generates eight greedy continuation tokens
+and records final-layer hidden states and top-5 logprobs at every step.
+
+| Test | External group-block hits | Versus native reuse | Versus recomputation (continuation) |
+|---|---:|---|---|
+| Gemma-2-2B-IT, bf16, full + SW groups | 132 (64 SW + 68 full) | Tokens, hidden states, top-5 logprobs exactly equal | Tokens equal; hidden max-abs 0.75, minimum cosine 0.9999332323 |
+| Tiny DeepSeek-V2 MLA, seeded dummy weights, real vLLM kernels | 6 | Tokens, hidden states, top-5 logprobs exactly equal | Tokens equal; hidden max-abs 0.00390625, minimum cosine 0.9999995046 |
+| Gemma-2-2B-IT, per-tensor FP8 KV, full + SW groups | 132 | Tokens, hidden states, top-5 logprobs exactly equal | Tokens equal; hidden max-abs 0.810546875, minimum cosine 0.9998348246 |
+
+Gemma's shared prefix is 4,352 tokens, beyond its 4,096-token window.
+The connector restores the live trailing window and does not require the
+four dead leading SW pages. The producer requests also match their
+recompute controls exactly. The reuse-vs-recompute numerical differences
+are shared with native prefix reuse; they are not hidden by the comparison.
+This is a small deterministic validation corpus, not a claim of bitwise
+recompute equality or full-vocabulary logit-KL certification.
+
+### Transfer matrix
+
+`python tests/integration/m4_bench.py`: synthetic 8-layer groups, 64 blocks,
+10 repetitions, wall-clock including Python submission/event waits; no
+codec or diagnostic readback. Values are GB/s (decimal).
+
+| Kind | D2H | H2D |
+|---|---:|---:|
+| Padded latent | 10.24 | 8.51 |
+| Sliding-window attention | 12.18 | 11.00 |
+| Sparse index | 1.76 | 2.30 |
+| Inline FP8 content | 11.39 | 9.95 |
+
+Small sparse pages remain submission-bound. This benchmark does not
+establish the M3 80%-of-pinned-copy target or broad serving performance.
+The initial hybrid end-to-end continuation smoke measured 0.382 s with
+OmniKV readback disabled, 0.615 s recomputation, and 0.275 s native GPU
+prefix reuse. These are single runs including hidden-state instrumentation;
+no statistical speedup claim is made. Diagnostic readback increased the
+OmniKV hybrid continuation to 1.133 s, so that gate must not be used for
+performance comparisons.
+
+### Recurrent spike and test setup issues
+
+Recurrent result: **NO-GO**, explicitly rejected. Installed align-mode
+Mamba code retains boundary-specific copy-on-write snapshots; the existing
+request-finished block-table lifecycle does not prove their identity or
+ordering. Details and required next steps are in M4.md. No Qwen3-Next
+recurrent model serving claim is made.
+
+An orphaned earlier M4 test initially occupied about 9 GB and caused the
+first Qwen regression attempt to OOM. It was identified by its test command
+and terminated before rerunning successfully. Initial test-runner attempts
+also exposed installed API differences: DeepSeek config requires an integer
+expert count; EngineArgs accepts `kv_cache_dtype` and no longer accepts
+`calculate_kv_scales`. Those fixtures were corrected locally and resynced.
+The timing harness's missing output-list initialization was likewise fixed.
+FP8 FlashInfer kernels compiled successfully on first use (about 80 s for
+both windowed/non-windowed variants). No model weights were modified.
+
+### Final verification and TTFT
+
+After the final source sync, the combined remote command
+`pytest tests/unit tests/integration/test_m4_gpu.py -q` passed **114 tests
+in 8.26 s**. Final bf16 hybrid and FP8 hybrid runs, and the updated MLA
+run, again passed `m4_compare.py` against their native/recompute controls.
+
+With `disable_log_stats=False`, the installed vLLM metric is
+`RequestStateStats.first_token_latency` (not the older `first_token_time`).
+For the second 4,355-token Gemma request, a fresh-engine timing pair measured:
+
+| Mode | TTFT | End-to-end (8 tokens) |
+|---|---:|---:|
+| Full recomputation | 399.8 ms | 612.7 ms |
+| OmniKV, readback disabled | 158.6 ms | 364.4 ms |
+
+Observed TTFT delta: −241.2 ms (−60.3%) for this single warm continuation.
+Hidden-state capture is enabled in both runs. This is a smoke measurement,
+not a statistical performance claim. Full-precision and FP8 final outputs
+remain exactly equal to their respective native-prefix-cache controls.
+
+## 2026-11-21 — M5 validation and optimization (local complete; remote blocked)
+
+Scope implemented (all local-first, per the project workflow):
+
+- **Pitched 2-D copies**: `PageCopy2DOp` (cudaMemcpy2DAsync) + `plan_batch`
+  (coalesce → fold constant-stride chains). The M3-documented gap ("plain
+  coalescing merges nothing across blocks") is addressed at the op-planning
+  level; folding is provably byte-equivalent (interval-coverage unit tests;
+  the GPU bench adds an on-device byte-equality gate).
+- **Pinned scratch reuse**: conversion + L1-verify paths use persistent
+  runtime scratch slots instead of per-call cudaHostAlloc; separate slots
+  prevent a read-back growth from freeing live conversion sources.
+- **Hash path**: one `struct.pack` per call (byte-identical digests to the
+  M1-M4 per-token encoding — unit-proven, so store keys are unchanged);
+  extendable chains + per-request memoization across scheduler re-queries.
+- **Adapter bug closed (found by writing the golden-offset fuzz)**:
+  block-outermost layouts with kernel-block splits (ratio>1) previously
+  registered and would copy interleaved bytes silently; now a hard
+  `RegistrationError` (BLNHC/BLHNC/BHLNC each unit-tested).
+- **Fuzz suites**: store/epoch randomized interleavings against a
+  linearized oracle (incl. reservations-never-evicted and LRU victim
+  order); adapter GPU fuzz with real CUDA tensors across all six families
+  (golden offsets + real-transfer byte identity) — the GPU leg awaits the
+  remote host.
+- **T6/T9/soak**: `m5_run.py` (128-request sweep with per-step scheduler
+  hook timing vs the 1 ms budget; KV-starved preemption stress) and the
+  100-round soak stage in `test_m5_matrix.py`.
+- **Head-to-head harness**: `m5_headtohead.py` (none/omnikv/pcache/lmcache
+  at hit rates 0/50/90) and `m5_flexkv_run.py` (legacy control env).
+- **Support matrix**: `docs/support_matrix.json` +
+  `test_support_matrix.py` (enum coverage, legend discipline, evidence
+  requirements, no-go/rejection permanence, FORMAT_VERSION tracking).
+- **Version shim**: dual-form unit sweep across all layouts (release vs
+  post-#61452 shapes); second-vLLM engine leg scripted in
+  `scripts/m5_remote_matrix.sh --with-shim-venv`.
+
+### Local validation results (this workstation, no CUDA)
+
+| Gate | Result |
+|---|---|
+| `uv run pytest tests/unit -q` | **128 passed, 15 skipped** (torch/vLLM/CUDA-gated skips) |
+| `ruff check src tests` | clean |
+| `mypy src/omnikv --ignore-missing-imports --no-warn-unused-ignores` | clean |
+| plan_batch coverage invariants (3 seeds, randomized ops) | ✅ |
+| Store fuzz vs oracle (4 seeds × 600 ops; reservation + LRU-victim + disk) | ✅ |
+| Hash packed-encoding equivalence vs per-token reference | ✅ |
+| Dual-form adapter sweep (6 layouts, both API shapes, equal fingerprints) | ✅ |
+
+### Remote status: BLOCKED (instance unreachable)
+
+- Repo default endpoint `connect.nmb2.seetacloud.com:10487` responds to
+  SSH but **rejects the local key** and its host key is unknown here —
+  the endpoint now maps to a different container.
+- The most recent working endpoint (Windows-side SSH config) was port
+  **12997**: currently **connection refused** — the instance is stopped
+  or was recycled.
+- No credentials are stored in the repository (by design), so resolving
+  this requires the AutoDL console: start the instance, note the new
+  port, and put it in `scripts/remote.env`.
+
+Everything is staged for one command once reachable:
+
+```sh
+scripts/m5_remote_matrix.sh                  # sync + units + fuzz + M1-M4 regression + M5 matrix + bench + head-to-head
+scripts/m5_remote_matrix.sh --with-shim-venv # + second vLLM (0.33.x) shim leg
+```
+
+Remote results and any fixes they force will be appended here when the
+runs complete.

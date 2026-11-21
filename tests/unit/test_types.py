@@ -72,7 +72,7 @@ class TestFormatFingerprint:
             make_fingerprint(layout="NHD")
 
     def test_version_bump_changes_identity(self):
-        assert make_fingerprint().identity != make_fingerprint(version=3).identity
+        assert make_fingerprint().identity != make_fingerprint(version=999).identity
 
     def test_fragments_change_identity(self):
         frag = make_fingerprint(

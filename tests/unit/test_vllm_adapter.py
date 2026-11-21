@@ -214,20 +214,58 @@ class TestDescribe:
         (desc,) = VllmLayoutAdapter().describe(make_kv_caches(), cfg)
         assert desc.geometry.num_layers == NUM_LAYERS
 
+    def test_main_form_all_layouts(self):
+        """M5 version-shim sweep: the post-#61452 group form must describe
+        every layout family with the same geometry as the release form."""
+        for layout in ("LBNHC", "LBHNC", "LHBNC", "BLNHC", "BLHNC", "BHLNC"):
+            release_cfg = make_release_config(layout)
+            main_cfg = make_release_config(layout)
+            main_cfg.kv_cache_groups = [
+                FakeGroupMain({n: FullAttentionSpec() for n in LAYER_NAMES})
+            ]
+            (rel,) = VllmLayoutAdapter().describe(make_kv_caches(layout), release_cfg)
+            (main,) = VllmLayoutAdapter().describe(make_kv_caches(layout), main_cfg)
+            assert rel.fingerprint == main.fingerprint, layout
+            assert rel.geometry == main.geometry, layout
+
+    def test_main_form_multiple_groups(self):
+        cfg = make_release_config()
+        cfg.kv_cache_groups = [
+            FakeGroupMain({n: FullAttentionSpec() for n in LAYER_NAMES[:14]}),
+            FakeGroupMain({n: FullAttentionSpec() for n in LAYER_NAMES[14:]}),
+        ]
+        descs = VllmLayoutAdapter().describe(make_kv_caches(), cfg)
+        assert [d.group_id for d in descs] == [0, 1]
+
+    def test_main_form_mixed_specs_rejected(self):
+        cfg = make_release_config()
+        cfg.kv_cache_groups = [
+            FakeGroupMain(
+                {
+                    n: (FullAttentionSpec() if i % 2 else FullAttentionSpec(head_size=64))
+                    for i, n in enumerate(LAYER_NAMES)
+                }
+            )
+        ]
+        with pytest.raises(RegistrationError, match="mixed per-layer formats"):
+            VllmLayoutAdapter().describe(make_kv_caches(), cfg)
+
     def test_unknown_group_form_rejected(self):
         cfg = make_release_config()
         cfg.kv_cache_groups = [SimpleNamespace()]
         with pytest.raises(RegistrationError, match="unrecognized KV cache group"):
             VllmLayoutAdapter().describe(make_kv_caches(), cfg)
 
-    def test_rejects_multiple_groups(self):
+    def test_multiple_groups(self):
         cfg = make_release_config()
         cfg.kv_cache_groups = [
             FakeGroupSpec(LAYER_NAMES[:14], FullAttentionSpec()),
             FakeGroupSpec(LAYER_NAMES[14:], FullAttentionSpec()),
         ]
-        with pytest.raises(RegistrationError, match="one KV cache group"):
-            VllmLayoutAdapter().describe(make_kv_caches(), cfg)
+        adapter = VllmLayoutAdapter()
+        descs = adapter.describe(make_kv_caches(), cfg)
+        assert [d.group_id for d in descs] == [0, 1]
+        assert len(adapter.placements) == 2
 
     def test_rejects_non_full_attention_spec(self):
         mamba_cls = type("MambaSpec", (FullAttentionSpec,), {})
@@ -248,13 +286,13 @@ class TestDescribe:
         with pytest.raises(RegistrationError, match="mixed per-layer formats"):
             VllmLayoutAdapter().describe(make_kv_caches(), cfg)
 
-    def test_rejects_quantized(self):
+    def test_describes_per_tensor_fp8(self):
         spec = FullAttentionSpec()
         spec.kv_quant_mode = _QuantMode("FP8_PER_TENSOR")
         cfg = make_release_config()
         cfg.kv_cache_groups = [FakeGroupSpec(LAYER_NAMES, spec)]
-        with pytest.raises(RegistrationError, match="quantized"):
-            VllmLayoutAdapter().describe(make_kv_caches(), cfg)
+        (desc,) = VllmLayoutAdapter().describe(make_kv_caches(), cfg)
+        assert desc.fingerprint.quant == "FP8_PER_TENSOR"
 
     def test_rejects_diff_kv_heads(self):
         spec = FullAttentionSpec(head_size=128)
@@ -349,6 +387,52 @@ class TestKernelBlockSplit:
             caches[name] = view
         with pytest.raises(RegistrationError, match="not divisible"):
             VllmLayoutAdapter().describe(caches, make_release_config("LBNHC"))
+
+    def test_block_outermost_kernel_split_rejected(self):
+        """M5 fail-closed: block-outermost layouts with kernel-block
+        splits scatter a manager block's page across kernel rows (stride
+        L*row between them), so single-run per-block addressing would
+        silently copy interleaved bytes. Registration must refuse."""
+        for layout in ("BLNHC", "BLHNC", "BHLNC"):
+            caches = {}
+            kern = N // 2
+            for i, name in enumerate(LAYER_NAMES):
+                view = FakeCachesTensor(0x1000 + i * PAGE)
+                view._shape = (NUM_BLOCKS * 2, H, kern, C)
+                view._strides = _strides_for_split(layout, kern)
+                caches[name] = view
+            with pytest.raises(RegistrationError, match="kernel-block splits"):
+                VllmLayoutAdapter().describe(caches, make_release_config(layout))
+
+    def test_layer_compact_kernel_split_supported(self):
+        """The same split on a layer-compact layout stays addressable:
+        kernel rows of one manager block are contiguous within a layer."""
+        caches = {}
+        kern = N // 2
+        for i, name in enumerate(LAYER_NAMES):
+            view = FakeCachesTensor(0x1000 + i * PAGE)
+            view._shape = (NUM_BLOCKS * 2, H, kern, C)
+            view._strides = _strides_for_split("LBHNC", kern)
+            caches[name] = view
+        adapter = VllmLayoutAdapter()
+        (_desc,) = adapter.describe(caches, make_release_config("LBHNC"))
+        ops = adapter.placements[0].gpu_ops(block_id=3)
+        assert ops[0][1] == PAGE  # whole manager page, one run
+
+
+def _strides_for_split(layout: str, kern: int) -> tuple[int, int, int, int]:
+    """Certified strides for a rank-4 view at kernel granularity
+    (rows = num_blocks * ratio, tokens = N // ratio)."""
+    row = kern * H * C
+    if layout == "BLNHC":
+        return (NUM_LAYERS * row, C, H * C, 1)
+    if layout == "BLHNC":
+        return (NUM_LAYERS * row, kern * C, C, 1)
+    if layout == "BHLNC":
+        return (H * NUM_LAYERS * row, NUM_LAYERS * row, C, 1)
+    if layout == "LBHNC":
+        return (row, kern * C, C, 1)
+    raise AssertionError(layout)
 
 
 class TestWorkerForms:

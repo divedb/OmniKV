@@ -1,0 +1,240 @@
+{
+  "hybrid": {
+    "kind": "hybrid",
+    "stats": {
+      "hits": 132,
+      "saved": 132,
+      "groups": {
+        "0": "sliding_window_kv",
+        "1": "paged_kv"
+      }
+    },
+    "requests": [
+      {
+        "native_exact": true,
+        "recompute_tokens_exact": true,
+        "recompute_hidden_max_abs": 0.0,
+        "recompute_hidden_min_cosine": 1.0
+      },
+      {
+        "native_exact": true,
+        "recompute_tokens_exact": true,
+        "recompute_hidden_max_abs": 0.75,
+        "recompute_hidden_min_cosine": 0.9999332322809371
+      }
+    ]
+  },
+  "mla": {
+    "kind": "mla",
+    "stats": {
+      "hits": 6,
+      "saved": 6,
+      "groups": {
+        "0": "latent_kv"
+      }
+    },
+    "requests": [
+      {
+        "native_exact": true,
+        "recompute_tokens_exact": true,
+        "recompute_hidden_max_abs": 0.0,
+        "recompute_hidden_min_cosine": 1.0
+      },
+      {
+        "native_exact": true,
+        "recompute_tokens_exact": true,
+        "recompute_hidden_max_abs": 0.00390625,
+        "recompute_hidden_min_cosine": 0.9999995045598373
+      }
+    ]
+  },
+  "fp8": {
+    "kind": "fp8",
+    "stats": {
+      "hits": 132,
+      "saved": 132,
+      "groups": {
+        "0": "sliding_window_kv",
+        "1": "paged_kv"
+      }
+    },
+    "requests": [
+      {
+        "native_exact": true,
+        "recompute_tokens_exact": true,
+        "recompute_hidden_max_abs": 0.0,
+        "recompute_hidden_min_cosine": 1.0
+      },
+      {
+        "native_exact": true,
+        "recompute_tokens_exact": true,
+        "recompute_hidden_max_abs": 0.810546875,
+        "recompute_hidden_min_cosine": 0.999834824594202
+      }
+    ]
+  },
+  "transfer_matrix": [
+    {
+      "kind": "latent_padded",
+      "blocks": 1,
+      "direction": "d2h",
+      "bytes": 591872,
+      "ms": 0.09816810488700867,
+      "GBps": 6.029168034579497
+    },
+    {
+      "kind": "latent_padded",
+      "blocks": 1,
+      "direction": "h2d",
+      "bytes": 591872,
+      "ms": 0.10689627379179001,
+      "GBps": 5.536881492734106
+    },
+    {
+      "kind": "latent_padded",
+      "blocks": 64,
+      "direction": "d2h",
+      "bytes": 37879808,
+      "ms": 3.6980831995606422,
+      "GBps": 10.243092422717906
+    },
+    {
+      "kind": "latent_padded",
+      "blocks": 64,
+      "direction": "h2d",
+      "bytes": 37879808,
+      "ms": 4.453166946768761,
+      "GBps": 8.506262723315544
+    },
+    {
+      "kind": "sliding_window",
+      "blocks": 1,
+      "direction": "d2h",
+      "bytes": 2097152,
+      "ms": 0.2181040123105049,
+      "GBps": 9.615375608103802
+    },
+    {
+      "kind": "sliding_window",
+      "blocks": 1,
+      "direction": "h2d",
+      "bytes": 2097152,
+      "ms": 0.2398557960987091,
+      "GBps": 8.743386793692274
+    },
+    {
+      "kind": "sliding_window",
+      "blocks": 64,
+      "direction": "d2h",
+      "bytes": 134217728,
+      "ms": 11.015144921839237,
+      "GBps": 12.184835419994563
+    },
+    {
+      "kind": "sliding_window",
+      "blocks": 64,
+      "direction": "h2d",
+      "bytes": 134217728,
+      "ms": 12.199471518397331,
+      "GBps": 11.001929698150764
+    },
+    {
+      "kind": "sparse_index",
+      "blocks": 1,
+      "direction": "d2h",
+      "bytes": 67584,
+      "ms": 0.057159923017024994,
+      "GBps": 1.1823668828222567
+    },
+    {
+      "kind": "sparse_index",
+      "blocks": 1,
+      "direction": "h2d",
+      "bytes": 67584,
+      "ms": 0.06107650697231292,
+      "GBps": 1.1065465814971547
+    },
+    {
+      "kind": "sparse_index",
+      "blocks": 64,
+      "direction": "d2h",
+      "bytes": 4325376,
+      "ms": 2.4636389687657356,
+      "GBps": 1.7556858187573563
+    },
+    {
+      "kind": "sparse_index",
+      "blocks": 64,
+      "direction": "h2d",
+      "bytes": 4325376,
+      "ms": 1.8773753196001053,
+      "GBps": 2.3039484725522743
+    },
+    {
+      "kind": "fp8_inline",
+      "blocks": 1,
+      "direction": "d2h",
+      "bytes": 1064960,
+      "ms": 0.11944174766540527,
+      "GBps": 8.916145491970658
+    },
+    {
+      "kind": "fp8_inline",
+      "blocks": 1,
+      "direction": "h2d",
+      "bytes": 1064960,
+      "ms": 0.13771280646324158,
+      "GBps": 7.733195098919577
+    },
+    {
+      "kind": "fp8_inline",
+      "blocks": 64,
+      "direction": "d2h",
+      "bytes": 68157440,
+      "ms": 5.983170308172703,
+      "GBps": 11.391525978610444
+    },
+    {
+      "kind": "fp8_inline",
+      "blocks": 64,
+      "direction": "h2d",
+      "bytes": 68157440,
+      "ms": 6.847365386784077,
+      "GBps": 9.953819629889901
+    }
+  ],
+  "environment": {
+    "vllm": "0.34.0",
+    "gpu": "RTX 3080 Ti 12 GB",
+    "date": "2026-11-21"
+  },
+  "hybrid_timing": {
+    "baseline": {
+      "seconds": [
+        1.389748141169548,
+        0.6126538403332233
+      ],
+      "ttft_seconds": [
+        0.40342211723327637,
+        0.3997933864593506
+      ]
+    },
+    "connector": {
+      "seconds": [
+        1.3738750610500574,
+        0.3644073698669672
+      ],
+      "ttft_seconds": [
+        0.42995691299438477,
+        0.15862822532653809
+      ]
+    },
+    "notes": "Single-run smoke; hidden-state capture enabled, diagnostic readback disabled. Not a statistically robust benchmark."
+  },
+  "tests": {
+    "remote_unit_and_m4_gpu": 114,
+    "m2_m3_regressions": 4,
+    "local_unit_passed": 86,
+    "local_unit_skipped": 15
+  }
+}
